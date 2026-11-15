@@ -69,8 +69,9 @@ test("extraction reports malformed segments instead of throwing", () => {
 });
 
 test("extraction reports a JSON scalar value as a parse error", () => {
-  // A scalar nested inside an array is yielded as an item, not an error.
-  assert.equal(extractJsonCandidates('[12345]').items.length, 1);
+  // A scalar nested inside an array is model noise and is filtered out —
+  // it must never reach proposal validation as a false candidate.
+  assert.equal(extractJsonCandidates('[12345]').items.length, 0);
   assert.equal(extractJsonCandidates('[12345]').parseErrors.length, 0);
   // A scalar used where an object is expected is an undecodable segment.
   assert.equal(extractJsonCandidates('{"a": 12345}').items.length, 0);
@@ -92,10 +93,72 @@ test("valid array elements are not re-reported as parse errors", () => {
   assert.equal(one.items.length, 1);
   assert.equal(one.parseErrors.length, 0);
 
+  // Scalar elements are filtered before validation; only the object survives.
   const scalars = '[1,{"title":"x b c d e"},2]';
   const two = extractJsonCandidates(scalars);
-  assert.deepEqual(two.items, [1, { title: "x b c d e" }, 2]);
+  assert.deepEqual(two.items, [{ title: "x b c d e" }]);
   assert.equal(two.parseErrors.length, 0);
+});
+
+test("prose brackets are never candidates: [from] alongside a valid array", () => {
+  // Live MiMo regression: explanatory prose with bracketed words ([from]) used
+  // to surface as "malformed segment" rejections next to the real proposals.
+  const text = 'The evidence comes [from] the manifest, [note: check] so:\n[{"title":"a b c d e","evidence":[]}]\nDone.';
+  const { items, parseErrors, segments, truncated } = extractJsonCandidates(text);
+  assert.deepEqual(items.map((i) => (i as { title?: string }).title), ["a b c d e"]);
+  assert.equal(parseErrors.length, 0, "prose brackets produce no diagnostic noise");
+  assert.equal(segments, 2, "the wrapper array and its nested object are counted separately");
+  assert.deepEqual(truncated, []);
+});
+
+test("a numeric prose bracket creates no false proposal", () => {
+  // [1] parses as a one-element number array; its scalar element is filtered
+  // instead of flowing into validation as an unvalidatable item.
+  const { items, parseErrors, truncated } = extractJsonCandidates("see step [1] and [2] for details, also [from tests]");
+  assert.equal(items.length, 0);
+  assert.equal(parseErrors.length, 0);
+  assert.deepEqual(truncated, []);
+});
+
+test("scalar elements inside a valid array are filtered before validation", () => {
+  const { items, parseErrors } = extractJsonCandidates('["from", 1, {"title":"x b c d e","evidence":[]}, true, null]');
+  assert.deepEqual(items, [{ title: "x b c d e", evidence: [] }]);
+  assert.equal(parseErrors.length, 0);
+});
+
+test("a truncated JSON tail is detected with and without balanced junk elsewhere", () => {
+  // Plain truncation mid-array: the deliverable was cut off.
+  const plain = extractJsonCandidates('[{"title": "cut off here');
+  assert.equal(plain.truncated.length, 1);
+  assert.match(plain.truncated[0]!, /^\[\{"title": "cut off here$/);
+  assert.equal(plain.items.length, 0);
+  assert.equal(plain.parseErrors.length, 0);
+
+  // Balanced junk + truncated deliverable: the cut is still detected and the
+  // junk neither becomes a proposal nor produces a rejection.
+  const withJunk = extractJsonCandidates('see step [1] and [from docs], then: [{"title": "cut');
+  assert.equal(withJunk.truncated.length, 1);
+  assert.match(withJunk.truncated[0]!, /\[\{"title": "cut$/);
+  assert.equal(withJunk.items.length, 0, "junk never becomes a proposal");
+
+  // Mid-object truncation.
+  const obj = extractJsonCandidates('{"problem": "the reply was cut before the object closed');
+  assert.equal(obj.truncated.length, 1);
+
+  // A markdown-fenced, complete array is not truncation.
+  const fenced = extractJsonCandidates('```json\n[{"title":"a b c d e","evidence":[]}]\n```\n');
+  assert.deepEqual(fenced.truncated, []);
+  assert.equal(fenced.items.length, 1);
+});
+
+test("ordinary prose with unmatched brackets never reports truncation", () => {
+  assert.deepEqual(extractJsonCandidates("see [note about {things").truncated, []);
+  assert.deepEqual(extractJsonCandidates('say "hello [world').truncated, []);
+  assert.deepEqual(extractJsonCandidates("see [1").truncated, []);
+  assert.deepEqual(extractJsonCandidates("see [from").truncated, []);
+  // Those texts carry no JSON at all: segments stays 0 so the engine's
+  // no-JSON diagnostic remains armed instead of the reply counting as JSON.
+  assert.equal(extractJsonCandidates("see [note about {things").segments, 0);
 });
 
 function bareProposalText(title: string, evidenceEntries: number): string {

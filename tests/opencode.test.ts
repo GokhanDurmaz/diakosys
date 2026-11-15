@@ -9,6 +9,7 @@ import {
   parseModelString,
   MockOpenCodeAdapter,
 } from "../src/opencode.ts";
+import { v1ReplyText } from "../src/opencode-v1.ts";
 
 test("parseModelString splits provider from model id keeping inside slashes", () => {
   assert.deepEqual(parseModelString("Qwen-Mimo/Admin/model.gguf"), {
@@ -25,6 +26,34 @@ test("parseModelString rejects malformed input", () => {
   assert.throws(() => parseModelString("no-slash"));
   assert.throws(() => parseModelString("/leading-slash"));
   assert.throws(() => parseModelString("trailing/"));
+});
+
+test("v1ReplyText keeps text parts in order and drops reasoning and tool parts", () => {
+  // Mirrors the v2 normalizeText filter: reasoning prose is full of balanced
+  // bracket fragments that must not enter the JSON scan.
+  const parts = [
+    { type: "reasoning", text: "thinking [from] about [1] brackets" },
+    { type: "tool", tool: "read", state: "completed" },
+    { type: "text", text: "first text" },
+    { type: "text", text: "second text" },
+  ];
+  assert.equal(v1ReplyText(parts), "first text second text");
+});
+
+test("v1ReplyText keeps reasoning prose out of the JSON-scanned reply", () => {
+  const parts = [
+    { type: "reasoning", text: "I will answer with [a] balanced bracket" },
+    { type: "text", text: '[{"title":"a b c d e","evidence":[]}]' },
+  ];
+  const text = v1ReplyText(parts);
+  assert.equal(text, '[{"title":"a b c d e","evidence":[]}]');
+  assert.ok(!text.includes("I will answer"), "reasoning prose must not enter the scanned text");
+});
+
+test("v1ReplyText preserves typeless text parts (older replies) and handles empty input", () => {
+  assert.equal(v1ReplyText([{ text: "legacy reply" }]), "legacy reply");
+  assert.equal(v1ReplyText([{ type: "text", text: "" }]), "");
+  assert.equal(v1ReplyText([]), "");
 });
 
 test("mock adapter records prompt inputs and returns canned result", async () => {

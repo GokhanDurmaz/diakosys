@@ -32,10 +32,17 @@ export interface ParsedProposals {
   items: unknown[];
   /** number of discovered JSON arrays/objects that could not be used */
   parseErrors: string[];
-  /** how many balanced JSON segments the text contained at all — 0 means the
-   * reply carried no JSON whatsoever (a distinct failure from "parsed but
-   * unusable"), so callers can surface it instead of reporting silent success. */
+  /** how many balanced, JSON-plausible segments the text contained — 0 means
+   * the reply carried no JSON whatsoever (a distinct failure from "parsed but
+   * unusable"), so callers can surface it instead of reporting silent success.
+   * Ordinary prose brackets ([from], [1], [note: …]) are not JSON candidates
+   * (see plausiblyJsonArray) and are never counted. */
   segments: number;
+  /** Bounded snippets of plausible unterminated JSON at the end of the text —
+   * a model reply cut off mid-array or mid-object (e.g. by an output-length
+   * limit). Empty when the text ends cleanly; ordinary prose with unmatched
+   * brackets never qualifies (see plausibleTruncatedTail). */
+  truncated: string[];
 }
 
 /** Bounded segment snippet embedded in parse errors so callers can see which text failed. */
@@ -45,15 +52,87 @@ function parseErrorText(message: string, segment: string): string {
 }
 
 /**
+ * Token-aware check: does a balanced `[…]` segment plausibly contain JSON?
+ * The first token after the opener must start a JSON value — an object, a
+ * string, a number, a negative number, or a complete true/false/null literal.
+ * Words like "from" share a first letter with "false" but are not JSON
+ * values, so prose brackets ([from], [note: …]) are excluded — never parsed,
+ * never reported, never counted as segments.
+ */
+function plausiblyJsonArray(segment: string): boolean {
+  // segment[0] === "[" by construction; skip whitespace after the opener.
+  let i = 1;
+  while (i < segment.length && /\s/.test(segment[i]!)) i++;
+  const rest = segment.slice(i);
+  if (rest.length === 0) return false; // no value after the opener
+  const ch = rest[0]!;
+  if (ch === "{" || ch === "]" || ch === '"') return true; // objects, empty array, string arrays
+  if (ch >= "0" && ch <= "9") return true;
+  if (ch === "-" && /^-\s*[0-9]/.test(rest)) return true;
+  return /^(?:true|false|null)(?![a-zA-Z0-9])/.test(rest);
+}
+
+/** Only object elements can become proposals; scalar array elements are noise. */
+function isObjectElement(value: unknown): boolean {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Detect a plausible unterminated-JSON tail at the end of the text: the
+ * outermost bracket opener still unclosed when the text ends, i.e. a reply
+ * cut off mid-array or mid-object. The tail qualifies only when it carries
+ * JSON syntax — the value after the opener starts as an object or a string,
+ * or the tail contains a quote-before-colon key signature. Bare brackets,
+ * numbers and bare words ("see [note", "see [1", "[from]") never qualify, so
+ * ordinary explanatory prose cannot trigger a false truncation report.
+ * Returns the tail text (unbounded; callers must bound snippets).
+ */
+function plausibleTruncatedTail(text: string): string | undefined {
+  const stack: number[] = []; // indexes of unclosed openers
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "[" || ch === "{") stack.push(i);
+    else if (ch === "]" || ch === "}") stack.pop();
+  }
+  if (stack.length === 0) return undefined;
+  const index = stack[0]!; // outermost unclosed opener — the cut region's root
+  const tail = text.slice(index);
+  let j = index + 1;
+  while (j < text.length && /\s/.test(text[j]!)) j++;
+  const ch = text[j];
+  if (ch === "{" || ch === '"') return tail;
+  const firstQuote = tail.indexOf('"');
+  if (firstQuote !== -1 && tail.indexOf(":", firstQuote + 1) !== -1) return tail;
+  return undefined;
+}
+
+/**
  * Extract candidate JSON values from free-form model text. Handles fenced
  * ```json blocks, surrounding prose, wrapper objects like {"proposals": [...]},
- * and single proposal objects. Never throws on malformed input; reports what
- * could not be parsed.
+ * and single proposal objects. Ordinary prose brackets that cannot start a
+ * JSON value ([from], [1]) are skipped without diagnostics; plausible
+ * truncated JSON at the end of the text is reported in `truncated`. Never
+ * throws on malformed input; reports what could not be parsed.
  */
 export function extractJsonCandidates(text: string): ParsedProposals {
   const items: unknown[] = [];
   const parseErrors: string[] = [];
-  const arrays = collectBalancedSegments(text, "[");
+  const arrays = collectBalancedSegments(text, "[").filter((s) => plausiblyJsonArray(s.text));
   const objects = collectBalancedSegments(text, "{");
   // Objects nested inside an array segment are already yielded by the array
   // branch — parsing them again double-counts every element. Skip any object
@@ -89,11 +168,14 @@ export function extractJsonCandidates(text: string): ParsedProposals {
       continue;
     }
     if (Array.isArray(value)) {
-      items.push(...value);
+      // Only object elements can become proposals; scalars (numbers, strings,
+      // booleans) inside arrays are model noise and are dropped here instead
+      // of surfacing as unvalidatable items.
+      items.push(...value.filter(isObjectElement));
     } else if (value !== null && typeof value === "object") {
       const wrapper = value as Record<string, unknown>;
       if (Array.isArray(wrapper["proposals"])) {
-        items.push(...(wrapper["proposals"] as unknown[]));
+        items.push(...(wrapper["proposals"] as unknown[]).filter(isObjectElement));
       } else if (isProposalShaped(wrapper)) {
         items.push(value);
         consumedProposalSpans.push(segment);
@@ -104,7 +186,13 @@ export function extractJsonCandidates(text: string): ParsedProposals {
       parseErrors.push(parseErrorText("JSON scalar ignored", segment.text));
     }
   }
-  return { items, parseErrors, segments: arrays.length + objects.length };
+  const truncatedTail = plausibleTruncatedTail(text);
+  return {
+    items,
+    parseErrors,
+    segments: arrays.length + objects.length,
+    truncated: truncatedTail === undefined ? [] : [truncatedTail.slice(0, 160)],
+  };
 }
 
 function collectBalancedSegments(text: string, opener: "[" | "{"): SegmentSpan[] {

@@ -44,10 +44,20 @@ export interface OrchestratorConfig {
 export interface UserConfig {
   /** OpenAI-compatible model server endpoint. */
   endpoint?: string;
+  /** First-run setup schema version (1), written by src/first-run.ts. */
+  version?: number;
+  /** Provider id saved by the first-run setup (e.g. "mimo-q8-m5"). */
+  provider?: string;
+  /** Model id saved by the first-run setup (e.g. "mimo-q8"). */
+  modelId?: string;
+  /** Model display name saved by the first-run setup (informational). */
+  modelName?: string;
+  /** Primary agent saved by the first-run setup (e.g. "build"). */
+  agent?: string;
   /**
-   * Anything else is accepted and ignored. The only key the orchestrator
-   * reads is `endpoint`; extra keys are tolerated so a hand-written file is
-   * not rejected wholesale.
+   * Anything else is accepted and ignored. The keys the orchestrator reads
+   * are `endpoint`, `provider`, `modelId` and `agent`; extra keys are
+   * tolerated so a hand-written file is not rejected wholesale.
    */
   [key: string]: unknown;
 }
@@ -56,6 +66,11 @@ export interface UserConfig {
 export const CONFIG_HOME = "~/.config";
 export const CONFIG_DIR_NAME = "diakosys";
 export const CONFIG_FILE_NAME = "config.json";
+
+/** Absolute path of the user-level config file: `<home>/.config/diakosys/config.json`. */
+export function userConfigPath(): string {
+  return path.join(expandHome(CONFIG_HOME), CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+}
 
 /** Expand `~` in a config location; the location itself stays out of tracked source. */
 function expandHome(h: string): string {
@@ -66,6 +81,11 @@ function expandHome(h: string): string {
 function env(name: string): string | undefined {
   const value = process.env[name];
   return value === undefined || value === "" ? undefined : value;
+}
+
+/** A saved config value usable as a string: present and non-blank. */
+function savedString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
 function num(name: string, fallback: number): number {
@@ -165,8 +185,7 @@ function narrowUserConfig(parsed: unknown): UserConfig {
  * report the problem instead of running on a stale endpoint.
  */
 export function readUserConfig(): UserConfig | undefined {
-  const filePath = expandHome(CONFIG_HOME);
-  const configFile = path.join(filePath, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+  const configFile = userConfigPath();
   if (!fs.existsSync(configFile)) return undefined;
   let parsed: unknown;
   try {
@@ -198,15 +217,30 @@ export function resolveEndpoint(): string {
  * Resolve effective configuration in priority order:
  * DIAKOSYS_ORCHESTRATOR_MODEL ("provider/modelId")
  *   > DIAKOSYS_ORCHESTRATOR_PROVIDER + DIAKOSYS_ORCHESTRATOR_MODEL_ID
- *   > DIAKOSYS_ENDPOINT (then the user config file
- *   `~/.config/diakosys/config.json`, then the documented safe default).
+ *   > provider/modelId saved in `~/.config/diakosys/config.json` by the
+ *   first-run setup > documented safe defaults.
+ * The endpoint resolves as DIAKOSYS_ENDPOINT > saved endpoint > safe default
+ * (see resolveEndpoint); the agent resolves as DIAKOSYS_ORCHESTRATOR_AGENT >
+ * saved agent, with no default (absent means the opencode default agent).
  * Everything is overridable; nothing is secret — credentials stay in the
  * opencode/llama.cpp configuration, never here or in logs.
  */
 export function resolveConfig(): OrchestratorConfig {
   const fullModel = env("DIAKOSYS_ORCHESTRATOR_MODEL");
-  const providerOnly = env("DIAKOSYS_ORCHESTRATOR_PROVIDER") ?? (fullModel === undefined ? DEFAULT_PROVIDER : undefined);
-  const modelIdOnly = env("DIAKOSYS_ORCHESTRATOR_MODEL_ID") ?? (fullModel === undefined ? DEFAULT_MODEL_ID : undefined);
+  // The first-run setup's saved values sit between the environment and the
+  // built-in defaults: explicit env vars still win, but a saved
+  // provider/modelId/agent replaces the defaults when no env override exists.
+  const user = readUserConfig();
+  const providerOnly =
+    env("DIAKOSYS_ORCHESTRATOR_PROVIDER") ??
+    (fullModel === undefined
+      ? savedString(user?.provider) ?? DEFAULT_PROVIDER
+      : undefined);
+  const modelIdOnly =
+    env("DIAKOSYS_ORCHESTRATOR_MODEL_ID") ??
+    (fullModel === undefined
+      ? savedString(user?.modelId) ?? DEFAULT_MODEL_ID
+      : undefined);
   const model = fullModel ?? `${providerOnly}/${modelIdOnly}`;
   const provider = fullModel === undefined ? (providerOnly as string) : model.slice(0, model.indexOf("/"));
   const modelId = fullModel === undefined ? (modelIdOnly as string) : model.slice(model.indexOf("/") + 1);
@@ -220,7 +254,7 @@ export function resolveConfig(): OrchestratorConfig {
     port: num("DIAKOSYS_ORCHESTRATOR_PORT", DEFAULT_PORT),
     startupTimeoutMs: num("DIAKOSYS_ORCHESTRATOR_STARTUP_TIMEOUT_MS", DEFAULT_STARTUP_TIMEOUT_MS),
     promptTimeoutMs: num("DIAKOSYS_ORCHESTRATOR_PROMPT_TIMEOUT_MS", DEFAULT_PROMPT_TIMEOUT_MS),
-    agent: env("DIAKOSYS_ORCHESTRATOR_AGENT"),
+    agent: env("DIAKOSYS_ORCHESTRATOR_AGENT") ?? savedString(user?.agent),
     discoveryPromptTimeoutMs: num("DIAKOSYS_ORCHESTRATOR_DISCOVERY_TIMEOUT_MS", DEFAULT_DISCOVERY_TIMEOUT_MS),
     discoveryMaxProposals: num("DIAKOSYS_ORCHESTRATOR_DISCOVERY_MAX_PROPOSALS", DEFAULT_DISCOVERY_MAX_PROPOSALS),
     discoveryMaxAreas: num("DIAKOSYS_ORCHESTRATOR_DISCOVERY_MAX_AREAS", DEFAULT_DISCOVERY_MAX_AREAS),

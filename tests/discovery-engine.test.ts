@@ -248,6 +248,90 @@ test("runArea names finish=tool-calls for an empty-text reply (the model ended o
   }
 });
 
+test("a plausible truncated JSON reply surfaces a truncation diagnostic with the finish reason", async () => {
+  // Live failure mode: the reply was cut off mid-array, the segmenter dropped
+  // the unterminated segment silently, and the run looked like a clean
+  // "ok (0 proposals, 0 rejected)". The cut deliverable must surface as a
+  // rejection that names the finish reason.
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const adapter = new MockOpenCodeAdapter(() => '[{"title": "cut off mid-array');
+  try {
+    const result = await new DiscoveryEngine(adapter, {
+      repoDir: dir,
+      model: MODEL,
+      maxProposalsPerArea: 3,
+      promptTimeoutMs: 5000,
+      cacheDir,
+      areas: ["reliability"],
+      dryRun: true,
+    }).run();
+    const area = result.areas[0]!;
+    assert.equal(area.status, "ok", "the run itself still completes");
+    assert.equal(area.proposals.length, 0);
+    assert.equal(area.rejected.length, 1, "the truncated reply must surface as exactly one rejection");
+    assert.match(area.rejected[0]!.reason, /^possibly truncated JSON in the model reply \(\d+ chars, finish=stop\)$/);
+    assert.match(area.rejected[0]!.raw, /"title": "cut off mid-array/);
+    assert.ok(area.rejected[0]!.raw.length <= 160, "the snippet stays bounded");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("truncation is still detected when balanced junk segments accompany the cut deliverable", async () => {
+  // Balanced prose brackets around a truncated array: the junk ([1], [from
+  // docs]) must not mask the cut, and must not add rejections of its own.
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const adapter = new MockOpenCodeAdapter(() => 'see step [1] and [from docs], then: [{"title": "cut');
+  try {
+    const result = await new DiscoveryEngine(adapter, {
+      repoDir: dir,
+      model: MODEL,
+      maxProposalsPerArea: 3,
+      promptTimeoutMs: 5000,
+      cacheDir,
+      areas: ["reliability"],
+      dryRun: true,
+    }).run();
+    const area = result.areas[0]!;
+    assert.equal(area.rejected.length, 1, "only the truncation is reported — junk brackets produce no noise");
+    assert.match(area.rejected[0]!.reason, /^possibly truncated JSON in the model reply \(\d+ chars, finish=stop\)$/);
+    assert.match(area.rejected[0]!.raw, /\{"title": "cut/);
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("ordinary prose with unmatched brackets keeps the no-JSON diagnostic, not truncation", async () => {
+  // Prose brackets ("see [note about {things and such") are not JSON: no
+  // truncation diagnostic, no parse errors — the no-JSON rejection is the
+  // honest report for such a reply.
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const adapter = new MockOpenCodeAdapter(() => "see [note about {things and such");
+  try {
+    const result = await new DiscoveryEngine(adapter, {
+      repoDir: dir,
+      model: MODEL,
+      maxProposalsPerArea: 3,
+      promptTimeoutMs: 5000,
+      cacheDir,
+      areas: ["reliability"],
+      dryRun: true,
+    }).run();
+    const area = result.areas[0]!;
+    assert.equal(area.rejected.length, 1);
+    assert.match(area.rejected[0]!.reason, /^no JSON in the model reply \(\d+ chars, finish=stop\)$/);
+    assert.ok(!area.rejected[0]!.reason.includes("truncated"), "prose brackets must never report truncation");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
 test("a valid empty JSON array still reports ok with no rejections (not a no-JSON failure)", async () => {
   // The diagnostic must not misfire on the legitimate "nothing worth
   // proposing" reply: [] parses fine, so segments > 0 and no rejection.
@@ -440,14 +524,40 @@ test("areaInstruction is exported, states the read-only tool budget, and describ
 test("areaInstruction requires verification as a non-empty array of concrete command strings", () => {
   const area = DISCOVERY_AREAS.find((a) => a.key === "reliability")!;
   const prompt = areaInstruction(area, 3, repoManifest(REPO_DIR, 120, ["src/main/"]));
-  // the schema block keeps the verification field with a grounded example
-  assert.ok(prompt.includes('"verification": ["./gradlew test'), "the schema must show verification as an array with a real command shape");
+  // the schema block keeps the verification field with an example grounded in
+  // this repository's real test command (package.json), not a foreign build tool
+  assert.ok(prompt.includes('"verification": ["node --test tests/queue.test.ts"]'), "the schema must show verification as an array with this repo's real test command");
   // the requirement must be explicit: bare strings were observed live and are invalid
   assert.ok(prompt.includes('"verification" is REQUIRED'), "the requirement statement must be present");
   assert.ok(prompt.includes("non-empty JSON array of concrete"), "the array-of-commands contract must be stated");
   assert.ok(prompt.includes("never be a single string"), "the bare-string failure mode must be called out");
   assert.ok(prompt.includes("an empty array, or prose"), "empty array and prose must be called out");
   assert.ok(prompt.includes("validation rejects any proposal whose \"verification\""), "the rejection consequence must be stated");
+});
+
+test("areaInstruction's example object is valid JSON using this repository's real test command", () => {
+  const area = DISCOVERY_AREAS.find((a) => a.key === "reliability")!;
+  const prompt = areaInstruction(area, 3, repoManifest(REPO_DIR, 120, ["src/main/"]));
+  // The example must be pasteable, syntactically valid JSON: the failed live
+  // run's pseudo-JSON template (unquoted placeholders) taught the model a
+  // shape it could not reproduce, producing malformed segments.
+  const exampleLine = prompt.split("\n").find((l) => l.startsWith('{"title":'));
+  assert.ok(exampleLine !== undefined, "the prompt must contain a JSON example object");
+  const example = JSON.parse(exampleLine!) as Record<string, unknown>;
+  assert.deepEqual(example["verification"], ["node --test tests/queue.test.ts"], "the verification example must be this repository's real test command from package.json");
+  assert.ok(!prompt.includes("gradlew"), "the foreign gradle example must be gone");
+  assert.ok(prompt.includes("node --test"), "the real test command must appear in the instruction");
+});
+
+test("areaInstruction forbids invented evidence paths and points at the manifest and SOURCE excerpts", () => {
+  // The failed live run hallucinated tests/clock.test.ts by pattern-matching
+  // the tests/*.test.ts naming convention against src/clock.ts — the prompt
+  // must state that evidence paths come from the supplied manifest/excerpts.
+  const area = DISCOVERY_AREAS.find((a) => a.key === "tests")!;
+  const prompt = areaInstruction(area, 3, repoManifest(REPO_DIR));
+  assert.ok(prompt.includes("must be a repository-relative path that appears in the manifest or in"), "the path-citation rule must be present");
+  assert.ok(prompt.includes("never invent or extrapolate a path"), "inventing paths must be explicitly forbidden");
+  assert.ok(prompt.includes("citing a file that does not exist"), "the hallucinated-path consequence must be stated");
 });
 
 test("reliability manifest cap (120) applies per area while other areas keep the engine cap", async () => {

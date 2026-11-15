@@ -58,6 +58,13 @@ export interface V2PromptInput {
 export interface V2ServerOptions extends ServerOptions {
   directory: string;
   model: { providerID: string; modelID: string };
+  /**
+   * Primary agent for sessions created by this client (v2 selects the agent
+   * at session creation; there is no per-prompt agent parameter).
+   * undefined → the server's default agent, and the session.create body is
+   * unchanged from the previous behavior.
+   */
+  agent?: string;
   location?: { directory: string };
   password: string;
 }
@@ -75,6 +82,7 @@ export function createV2Client(server: { url: string; close(): void }, options: 
     location: options.location,
     modelProvider: options.model.providerID,
     modelId: options.model.modelID,
+    agent: options.agent,
     password: options.password,
     hostname: options.hostname,
     port: options.port,
@@ -100,6 +108,9 @@ function v2Create(client: ReturnType<typeof OpenCode.make>, options: V2ServerOpt
     void client
       .session.create({
         model: { providerID: options.model.providerID, id: options.model.modelID },
+        // The agent is bound at session creation in v2; omitted entirely when
+        // unset so the request body stays byte-identical to before.
+        ...(options.agent !== undefined ? { agent: options.agent } : {}),
         location: options.location ?? { directory: options.directory },
       })
       .then((created) => {
@@ -122,6 +133,8 @@ export interface V2ClientImplOptions {
   /** Configured model, propagated to session.create so the server runs the right provider/model. */
   modelProvider: string;
   modelId: string;
+  /** Primary agent for created sessions; undefined keeps the server default. */
+  agent?: string;
   password: string;
   hostname: string;
   port: number;
@@ -135,17 +148,19 @@ export class V2ClientImpl implements V2Client {
   private readonly location?: { directory: string };
   private readonly modelProvider: string;
   private readonly modelId: string;
+  private readonly agent: string | undefined;
   private readonly password: string;
   private readonly hostname: string;
   private readonly port: number;
   private readonly timeout: number;
-  constructor({ url, directory, client, location, modelProvider, modelId, password, hostname, port, timeout }: V2ClientImplOptions) {
+  constructor({ url, directory, client, location, modelProvider, modelId, agent, password, hostname, port, timeout }: V2ClientImplOptions) {
     this.url = url;
     this.directory = directory;
     this.client = client;
     this.location = location;
     this.modelProvider = modelProvider;
     this.modelId = modelId;
+    this.agent = agent;
     this.password = password;
     this.hostname = hostname;
     this.port = port;
@@ -158,6 +173,7 @@ export class V2ClientImpl implements V2Client {
     return v2Create(this.client, {
       directory: this.directory,
       model: { providerID: this.modelProvider, modelID: this.modelId },
+      agent: this.agent,
       location: this.location ?? { directory: this.directory },
       password: this.password,
       hostname: this.hostname,

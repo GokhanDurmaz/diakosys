@@ -126,6 +126,25 @@ function v1Abort(client: OpencodeClient, sessionId: string): Promise<void> {
   });
 }
 
+/**
+ * Assistant reply text for the JSON scan: text parts only, in order.
+ * Reasoning and tool parts never enter the scanned text (mirrors the v2
+ * normalizeText filter, opencode-v2.ts) — a reasoning part's prose is full of
+ * balanced bracket fragments that would otherwise surface as bogus parse
+ * errors. Typeless parts that still carry text keep working (older replies).
+ * Exported for tests.
+ */
+export function v1ReplyText(parts: unknown[]): string {
+  const texts: string[] = [];
+  for (const part of parts) {
+    const p = part as { type?: unknown; text?: unknown };
+    if (p.type !== undefined && p.type !== "text") continue;
+    if (typeof p.text !== "string" || p.text.length === 0) continue;
+    texts.push(p.text);
+  }
+  return texts.join(" ").trim();
+}
+
 async function v1Prompt(client: OpencodeClient, input: V1PromptInput): Promise<OpenCodePromptResult> {
   const text = [
     `Task: ${input.title}`,
@@ -194,17 +213,12 @@ async function v1Prompt(client: OpencodeClient, input: V1PromptInput): Promise<O
       throw new Error(`opencode session ${input.sessionId} has no assistant message`);
     }
     const parts = assistant.parts ?? [];
-    const reply = parts
-      .map((p) => (typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
-      .filter((s) => s.length > 0)
-      .join(" ")
-      .trim();
     const info = assistant.info as { finish?: string; role?: string };
     return {
       sessionId: input.sessionId,
       finish: String(info.finish ?? "unknown"),
       role: String(info.role ?? "assistant"),
-      text: reply,
+      text: v1ReplyText(parts),
       raw: { info, parts },
     };
   }

@@ -432,6 +432,26 @@ export function renderSourceEvidenceBlock(excerpts: SourceEvidence[]): string {
 }
 
 /**
+ * Bounded (≤160 chars) snippet of an item that failed validation, so the
+ * operator sees the offending model output — the actual object or scalar —
+ * instead of only its title (or "<untitled>"), without dumping the whole
+ * response.
+ */
+function itemSnippet(item: unknown): string {
+  let text: string;
+  if (typeof item === "string") {
+    text = item;
+  } else {
+    try {
+      text = JSON.stringify(item) ?? String(item);
+    } catch {
+      text = String(item);
+    }
+  }
+  return text.length > 160 ? `${text.slice(0, 157)}...` : text;
+}
+
+/**
  * Turns optional path-prefix priorities into a rank function: the first
  * matching prefix wins, unmatched files rank after every listed prefix. With
  * no priorities every file ranks 0, so the sort degenerates to
@@ -534,22 +554,25 @@ export function areaInstruction(area: DiscoveryArea, maxProposals: number, manif
     "",
     "Report possible improvement tasks for THIS AREA ONLY as a JSON array. Do not invent issues:",
     "every claim must cite repository evidence you actually inspected with a tool.",
-    "Each array element must be an object with exactly these fields:",
-    `  {"title": string (5-120 chars), "problem": string (>=40 chars, concrete),`,
-    `   "rationale": string, "evidence": [{"file": "repo-relative path that exists",`,
-    `   "symbol": "class/method/line you inspected", "observation": string}],`,
-    `   "approach": string, "outcome": string, "priority": 0-9,`,
-    `   "complexity": "low"|"medium"|"high", "risks": string,`,
-    `   "verification": ["./gradlew test --tests io.diakosys.infrastructure.jvm.JmxThreadCollectorTest"],`,
-    `   "dependencies": [optional titles of tasks this one depends on]}`,
+    "Each array element must be a JSON object with exactly these fields, in the shape of this example:",
+    `{"title": "Guard executeNext against negative batch sizes", "problem": "A negative --max drains zero tasks and the round completes silently without progress.", "rationale": "Silent no-ops hide coordinator stalls from the operator.", "evidence": [{"file": "src/queue.ts", "symbol": "executeNext", "observation": "the limit is used without a sign check"}], "approach": "Validate the limit before the drain loop and fail loudly.", "outcome": "Invalid invocations are rejected with a clear error.", "priority": 2, "complexity": "low", "risks": "May surface previously hidden caller bugs.", "verification": ["node --test tests/queue.test.ts"], "dependencies": []}`,
+    "",
+    `Field constraints: "title" 5-120 chars; "problem" at least 40 concrete chars; "priority" an`,
+    `integer 0-9; "complexity" one of "low"|"medium"|"high"; "evidence" one or more entries;`,
+    `"dependencies" an array of titles of tasks this one depends on (omit the field or use []`,
+    `when there are none). The file paths in the example are illustrative only.`,
     "",
     `"verification" is REQUIRED and must be a non-empty JSON array of concrete, runnable`,
-    `command strings for THIS repository (e.g. a gradle test command that would exercise`,
-    `the fixed behavior once the task is implemented). It must never be a single string,`,
+    `command strings for THIS repository (e.g. "node --test tests/queue.test.ts" — this project's`,
+    `real test command from package.json). It must never be a single string,`,
     `an empty array, or prose: validation rejects any proposal whose "verification" is`,
     `missing, empty, or not an array of command strings — such a proposal cannot become`,
     `a task. Commands need not exist yet, but must be executable as written against the`,
     `repository's real build system.`,
+    "",
+    `Every "evidence.file" must be a repository-relative path that appears in the manifest or in`,
+    `the SOURCE excerpts below — never invent or extrapolate a path: validation rejects any`,
+    `proposal citing a file that does not exist in the repository.`,
     "",
     `Provide at most ${maxProposals} proposals — the strongest ones only.`,
     "If the area yields nothing worth proposing, return [].",
@@ -727,8 +750,21 @@ export class DiscoveryEngine {
       areaId: area.key,
       durationMs: Date.now() - areaStartedAt,
     });
-    const { items, parseErrors, segments } = extractJsonCandidates(response.text);
+    const { items, parseErrors, segments, truncated } = extractJsonCandidates(response.text);
     const rejected: RejectedProposal[] = parseErrors.map((reason) => ({ area: area.key, reason, raw: reason }));
+    // A plausible truncated-JSON tail (the reply was cut off mid-array or
+    // mid-object, e.g. by the model server's output limit) is reported with
+    // the finish reason, even when other balanced segments parsed alongside
+    // it — a cut deliverable must never look like a clean partial result.
+    // Ordinary prose with unmatched brackets never reaches this branch: the
+    // tail detector only fires on JSON-shaped syntax.
+    if (truncated.length > 0) {
+      rejected.push({
+        area: area.key,
+        reason: `possibly truncated JSON in the model reply (${response.text.trim().length} chars, finish=${response.finish})`,
+        raw: truncated[0]!.replace(/\s+/g, " "),
+      });
+    }
     // A reply with no JSON at all (no parseable proposals, no parse errors and
     // no JSON segments) must never silently become an "ok" result with 0
     // proposals and 0 rejections. The clearest symptom: the model spent its
@@ -739,8 +775,8 @@ export class DiscoveryEngine {
     // A valid empty JSON array ("[]", bare or prose-wrapped) is the legitimate
     // "nothing worth proposing" reply: it parses, so segments > 0 and it must
     // NOT surface as a no-JSON diagnostic — only a reply without any JSON
-    // segment is one.
-    if (items.length === 0 && parseErrors.length === 0 && segments === 0) {
+    // segment is one. A truncated tail is its own diagnostic above.
+    if (items.length === 0 && parseErrors.length === 0 && segments === 0 && truncated.length === 0) {
       const reply = response.text.trim();
       rejected.push({
         area: area.key,
@@ -763,7 +799,7 @@ export class DiscoveryEngine {
         rejected.push({
           area: area.key,
           reason: validated.reason ?? "unknown validation failure",
-          raw: String((item as { title?: string }).title ?? "<untitled>").slice(0, 120),
+          raw: itemSnippet(item),
         });
         continue;
       }

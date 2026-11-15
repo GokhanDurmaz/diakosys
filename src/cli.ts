@@ -13,6 +13,7 @@ import { executeNext } from "./runner.ts";
 import { TASK_STATES } from "./types.ts";
 import type { OrchestratorConfig } from "./config.ts";
 import { resolveConfig, ALL_DISCOVERY_AREAS } from "./config.ts";
+import { maybeFirstRunSetup } from "./first-run.ts";
 import type { TaskState } from "./types.ts";
 import {
   DiscoveryEngine,
@@ -94,7 +95,8 @@ const PLAN_VALUE_FLAGS = new Map<string, "text" | "number">();
   const argv = process.argv.slice(2);
   const command = argv[0];
 
-  if (command === undefined || command === "help") {
+  // explicit help command: print usage and return before anything interactive
+  if (command === "help") {
     usage(0);
     return;
   }
@@ -102,6 +104,23 @@ const PLAN_VALUE_FLAGS = new Map<string, "text" | "number">();
   // every subcommand must print usage for -h/--help BEFORE any adapter,
   // database or discovery runs — an unguarded --help could trigger live work
   if (argv.includes("-h") || argv.includes("--help")) {
+    usage(0);
+    return;
+  }
+
+  // First-run setup: an interactive terminal without a user config gets to
+  // pick model + agent from the global opencode config once, before the
+  // command resolves its configuration. The full gate — TTY, help arguments,
+  // --mock — is enforced inside maybeFirstRunSetup (see
+  // shouldRunFirstRunSetup); nothing is duplicated here, so scripted and
+  // non-interactive behavior is byte-identical to before. A bare invocation
+  // (`npm start`) passes the gate on a real TTY, gets the one-time setup,
+  // and then falls through to the usage screen below.
+  await maybeFirstRunSetup(argv);
+
+  // Bare invocation: after the (possible) one-time setup, keep the documented
+  // usage output and exit-0 behavior.
+  if (command === undefined) {
     usage(0);
     return;
   }

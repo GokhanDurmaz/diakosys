@@ -298,6 +298,9 @@ export class LiveOpenCodeAdapter implements OpenCodeAdapter {
             directory: this.locationDirectory,
             location: { directory: this.locationDirectory },
             model: { providerID: this.modelProvider, modelID: this.modelId },
+            // v2 selects the agent at session creation (no per-prompt agent);
+            // undefined keeps the server default.
+            agent: this.options.agent,
             password: server.password,
             hostname: hostname ?? DEFAULT_HOSTNAME,
             port: port ?? 0,
@@ -365,7 +368,9 @@ export class LiveOpenCodeAdapter implements OpenCodeAdapter {
         title: input.title,
         description: input.description,
         projectDirectory: input.directory,
-        agent: input.agent,
+        // Per-call agent wins; otherwise the configured primary agent from
+        // the orchestrator config applies (runner/verify pass no agent).
+        agent: input.agent ?? this.options.agent,
         tools: input.tools,
         model: parseModelString(this.options.model),
         promptTimeoutMs: this.options.promptTimeoutMs,

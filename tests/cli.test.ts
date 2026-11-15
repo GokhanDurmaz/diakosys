@@ -1732,6 +1732,15 @@ function rejectedProposal(title: string, evidenceFile: string): unknown {
   };
 }
 
+/** The rejection line prints the proposal as a bounded whole-item snippet
+ *  (JSON.stringify, capped at 160 chars with "...") followed by " — reason",
+ *  matching src/discovery.ts:itemSnippet. */
+function snippet(title: string, evidenceFile: string): string {
+  const item = rejectedProposal(title, evidenceFile);
+  const text = JSON.stringify(item) ?? String(item);
+  return `${text.length > 160 ? `${text.slice(0, 157)}...` : text} — evidence file does not exist in repo: ${evidenceFile}`;
+}
+
 test("discover lists every rejected proposal on stdout and stores the rejections in the run row (all-rejected case)", async () => {
   // The adapter delivered well-formed JSON for every area, so the area
   // status stays "ok" and the rejection-only run is not an "area failure":
@@ -1753,9 +1762,9 @@ test("discover lists every rejected proposal on stdout and stores the rejections
       r.stdout,
       [
         `area tests: ok (0 proposals, 3 rejected)`,
-        `  rejected: rejected one — evidence file does not exist in repo: does/not/exist/a.ts`,
-        `  rejected: rejected two — evidence file does not exist in repo: does/not/exist/b.ts`,
-        `  rejected: rejected three — evidence file does not exist in repo: does/not/exist/c.ts`,
+        `  rejected: ${snippet("rejected one", "does/not/exist/a.ts")}`,
+        `  rejected: ${snippet("rejected two", "does/not/exist/b.ts")}`,
+        `  rejected: ${snippet("rejected three", "does/not/exist/c.ts")}`,
         `discovery run completed: 0 tasks created from 0 proposals (3 rejected); run stored`,
       ].join("\n") + "\n",
     );
@@ -1805,7 +1814,7 @@ test("discover keeps accepted proposals when the adapter also returns rejected o
     assert.match(lines[1] ?? "", /^accepted \S+$/);
     assert.match(
       lines[2] ?? "",
-      /^  rejected: mixed rejected — evidence file does not exist in repo: does\/not\/exist\/m\.ts$/,
+      /^  rejected: \{"title":"mixed rejected"[^—]*— evidence file does not exist in repo: does\/not\/exist\/m\.ts$/,
     );
     assert.equal(
       lines[3],
