@@ -15,6 +15,7 @@ import { acquireInstanceLock, lockState } from "../src/coordinator.ts";
 import { TASK_STATES } from "../src/types.ts";
 import { makeProposal, restoreEnv } from "./helpers.ts";
 import { discover, validatePlanArgs, MOCK_DISCOVERY_REPLY } from "../src/cli.ts";
+import type { RejectedProposal } from "../src/discovery.ts";
 import { MockOpenCodeAdapter } from "../src/opencode.ts";
 
 /**
@@ -1440,6 +1441,32 @@ test("discover --dry-run prints proposals and persists nothing (no database, no 
   }
 });
 
+/** Drive `discover` in-process with a mock adapter, returning the isolated
+ *  HOME as well so a test can pre-populate it (e.g. make the manifest
+ *  directory unwritable) before the run. */
+async function discoverWithMockAndHome(
+  args: string[],
+  reply: string,
+): Promise<{ dbPath: string; home: string; close: () => void }> {
+  const { dbPath, home } = tempTarget();
+  const adapter = new MockOpenCodeAdapter(() => reply);
+  const savedEnv: NodeJS.ProcessEnv = {
+    DIAKOSYS_ORCHESTRATOR_DB: process.env.DIAKOSYS_ORCHESTRATOR_DB,
+    DIAKOSYS_ORCHESTRATOR_MODEL: process.env.DIAKOSYS_ORCHESTRATOR_MODEL,
+    HOME: process.env.HOME,
+  };
+  process.env.DIAKOSYS_ORCHESTRATOR_DB = dbPath;
+  process.env.DIAKOSYS_ORCHESTRATOR_MODEL = "Qwen-Mimo/model";
+  process.env.HOME = home;
+  try {
+    await discover(args, adapter);
+  } finally {
+    restoreEnv(savedEnv);
+  }
+  const db = openDatabase(dbPath);
+  return { dbPath, home, close: () => closeDatabase(db) };
+}
+
 /** Drive `discover` in-process with a mock adapter, returning the database it
  *  opened so the lock row can be read back afterwards.
  *
@@ -1849,6 +1876,172 @@ test("discover keeps accepted proposals when the adapter also returns rejected o
     };
     assert.equal(manifest.proposals.length, 1);
     assert.equal(manifest.proposals[0]?.title, "Document the queue claim invariant");
+  } finally {
+    await stub.close();
+  }
+});
+
+/** A proposal the engine's validateProposal accepts (its evidence file exists
+ *  and the observation is well-formed) but the auditor rejects: the cited
+ *  symbol does not appear in the file it cites (src/auditor.ts: evidence
+ *  symbol check). Used to drive the post-audit manifest correction. */
+function auditorRejectedProposal(title: string, evidenceFile: string): unknown {
+  return {
+    title,
+    problem: "A lease that expires without renewal leaves a task orphaned in IN_PROGRESS.",
+    rationale: "The lease must be renewed before it expires or the task is lost.",
+    evidence: [
+      {
+        file: evidenceFile,
+        symbol: "claimTaskDoesNotExist",
+        observation: "a lease that expires without renewal leaves a task orphaned in IN_PROGRESS",
+      },
+    ],
+    approach: "Add lease renewal before expiry in the claim path.",
+    outcome: "Leases are renewed before they expire and tasks are not orphaned.",
+    priority: 5,
+    complexity: "medium",
+    verification: ["npm test"],
+  };
+}
+
+// ——— Stage 10.3.5b: post-audit manifest correction (subprocess level) ———
+//
+// engine.run() writes the resumable-run manifest BEFORE the auditor runs, so
+// the manifest carries the pre-audit proposal set. The CLI re-persists the
+// audited result (src/cli.ts) so the manifest matches the verdicts that were
+// reported: only VALID proposals are accepted, and the auditor's rejections
+// are recorded in the manifest's existing `rejected` array. These tests drive
+// `discover` in-process with a mock adapter — no real adapter, no model
+// calls — and assert the corrected manifest contents.
+
+test("discover re-persists the audited manifest with only VALID proposals", async () => {
+  const { dbPath, home } = tempTarget();
+  const stub = await startDiscoveryStub(
+    JSON.stringify([JSON.parse(DISCOVERY_STUB_REPLY)[0], auditorRejectedProposal("Add lease renewal before expiry", "src/store.ts")]),
+  );
+  try {
+    const r = await runStubbed("discover", ["--area", "architecture"], dbPath, home, stub.url);
+    assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.stderr, "");
+    assert.match(r.stdout, /^area architecture: ok \(2 proposals, 0 rejected\)/);
+
+    // the manifest carries only the VALID proposal: the auditor-rejected one
+    // must not survive into the accepted set
+    const manifest = JSON.parse(fs.readFileSync(runsJsonPath(home), "utf8")) as {
+      proposals: Array<{ title: string }>;
+      rejected: Array<{ raw: string }>;
+    };
+    assert.equal(manifest.proposals.length, 1);
+    assert.equal(manifest.proposals[0]?.title, "Document the queue claim invariant");
+    assert.equal(manifest.rejected.length, 1, "the rejected proposal is carried on the rejected channel");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("discover records the auditor's rejections in the manifest's existing rejected array", async () => {
+  const { dbPath, home } = tempTarget();
+  const stub = await startDiscoveryStub(
+    JSON.stringify([JSON.parse(DISCOVERY_STUB_REPLY)[0], auditorRejectedProposal("Add lease renewal before expiry", "src/store.ts")]),
+  );
+  try {
+    const r = await runStubbed("discover", ["--area", "architecture"], dbPath, home, stub.url);
+    assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.stderr, "");
+
+    const manifest = JSON.parse(fs.readFileSync(runsJsonPath(home), "utf8")) as {
+      proposals: Array<{ title: string }>;
+      rejected: Array<RejectedProposal>;
+    };
+    assert.equal(manifest.proposals.length, 1);
+    assert.equal(manifest.rejected.length, 1, "the auditor's rejection must be recorded in the existing array");
+    assert.equal(manifest.rejected[0]?.raw, "Add lease renewal before expiry");
+    assert.equal(manifest.rejected[0]?.area, "architecture");
+    assert.match(manifest.rejected[0]?.reason, /evidence symbol "claimTaskDoesNotExist" does not appear in src\/store\.ts/);
+  } finally {
+    await stub.close();
+  }
+});
+
+test("discover reports persisted: true on the post-audit manifest write", async () => {
+  const { dbPath, home } = tempTarget();
+  const stub = await startDiscoveryStub(
+    JSON.stringify([JSON.parse(DISCOVERY_STUB_REPLY)[0], auditorRejectedProposal("Add lease renewal before expiry", "src/store.ts")]),
+  );
+  try {
+    const r = await runStubbed("discover", ["--area", "architecture"], dbPath, home, stub.url);
+    assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.stderr, "");
+
+    // The manifest serialises the run result, so the post-audit re-persist is
+    // observable as the result's persisted flag: the final write must be the
+    // one recorded.
+    const manifest = JSON.parse(fs.readFileSync(runsJsonPath(home), "utf8")) as {
+      proposals: Array<{ title: string }>;
+      rejected: Array<RejectedProposal>;
+      persisted: boolean;
+    };
+    assert.equal(manifest.persisted, true, "the final post-audit write must be recorded as persisted");
+    assert.equal(manifest.proposals.length, 1);
+    assert.equal(manifest.rejected.length, 1);
+    assert.equal(manifest.proposals[0]?.title, "Document the queue claim invariant");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("discover --dry-run still creates no manifest after the post-audit re-persist", async () => {
+  const { dbPath, home } = tempTarget();
+  const stub = await startDiscoveryStub(
+    JSON.stringify([JSON.parse(DISCOVERY_STUB_REPLY)[0], auditorRejectedProposal("Add lease renewal before expiry", "src/store.ts")]),
+  );
+  try {
+    const r = await runStubbed("discover", ["--dry-run", "--area", "architecture"], dbPath, home, stub.url);
+    assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.stderr, "");
+    assert.match(r.stdout, /^area architecture: ok \(2 proposals, 0 rejected\)/);
+    assert.match(r.stdout, /^dry run — nothing was persisted$/m);
+
+    // A dry run must never write the run manifest, even though the CLI now
+    // re-persists the audited result for normal runs.
+    assert.equal(fs.existsSync(runsJsonPath(home)), false, "a dry run must never write the run manifest");
+    assert.equal(fs.existsSync(dbPath), true, "the lock requires opening the database");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("discover reports persisted: false and leaves no manifest when the post-audit write fails", async () => {
+  const { dbPath, home } = tempTarget();
+  // Make the manifest directory unwritable: defaultCacheDir() is
+  // $HOME/Cache/diakosys-orchestrator, so a regular file at $HOME/Cache makes
+  // mkdirSync fail with EEXIST. Both the engine's pre-audit write and the
+  // CLI's post-audit re-persist use that same directory.
+  fs.writeFileSync(path.join(home, "Cache"), "regular file, not a directory");
+  const stub = await startDiscoveryStub(
+    JSON.stringify([JSON.parse(DISCOVERY_STUB_REPLY)[0], auditorRejectedProposal("Add lease renewal before expiry", "src/store.ts")]),
+  );
+  try {
+    const r = await runStubbed("discover", ["--area", "architecture"], dbPath, home, stub.url);
+    assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.stderr, "");
+
+    // The re-persist failed, so nothing may claim persistence: no manifest
+    // (the pre-audit write failed too, since it uses the same directory) and
+    // no stale "persisted" claim left behind.
+    assert.equal(fs.existsSync(runsJsonPath(home)), false, "a failed post-audit write must not leave a persisted manifest");
+
+    // The failure is manifest-specific: the task table is written through a
+    // different path and the accepted proposal still lands there.
+    const db = readDb(dbPath);
+    try {
+      const tasks = db.store.listTasks();
+      assert.equal(tasks.length, 1, "the accepted proposal still persists to the task table");
+      assert.equal(tasks[0]!.title, "Document the queue claim invariant");
+    } finally {
+      db.close();
+    }
   } finally {
     await stub.close();
   }

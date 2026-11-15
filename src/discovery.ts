@@ -247,7 +247,7 @@ export function collectEvidence(result: DiscoveryResult, repoDir: string): Evide
  * Where the resumable-run manifest lives. Kept outside the analysed
  * repository so a discovery run never pollutes the code it is inspecting.
  */
-function defaultCacheDir(): string {
+export function defaultCacheDir(): string {
   const home = process.env.HOME ?? process.env.USERPROFILE ?? ".";
   return path.join(home, "Cache", "diakosys-orchestrator");
 }
@@ -595,6 +595,12 @@ export class DiscoveryEngine {
   constructor(adapter: OpenCodeAdapter, options: DiscoveryOptions) {
     this.adapter = adapter;
     this.options = options;
+  }
+
+  /** Directory holding this engine's resumable-run manifest: an explicit
+   * `cacheDir` option, or the home-based default used by run()/persist(). */
+  get cacheDir(): string {
+    return this.options.cacheDir ?? defaultCacheDir();
   }
 
   /** Emit a lifecycle event to the optional observer; no-op when absent. */

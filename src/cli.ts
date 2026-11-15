@@ -19,6 +19,7 @@ import {
   DiscoveryEngine,
   DiscoveryRunStore,
   DISCOVERY_SERVER_CONFIG,
+  defaultCacheDir,
   selectAreas,
   validateRequestedAreas,
   type AreaResult,
@@ -788,6 +789,15 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
     // into the run's existing `rejected` array, and nothing is persisted.
     result.proposals = audited.proposals;
     result.rejected = audited.rejected;
+
+    // The manifest was written by engine.run() BEFORE the auditor ran, so it
+    // still carries the pre-audit proposal set. Re-persist the audited result
+    // so the resumable-run manifest matches the verdicts that were reported:
+    // only VALID proposals are accepted, and the auditor's rejections are
+    // recorded in the manifest's existing `rejected` array.
+    if (dryRun !== true) {
+      result.persisted = await engine.persist(result, engine.cacheDir);
+    }
 
     for (const area of result.areas) {
       process.stdout.write(
