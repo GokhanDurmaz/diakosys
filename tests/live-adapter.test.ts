@@ -875,16 +875,16 @@ test(
     const reply = JSON.stringify([
       {
         title: "Document the queue claim invariant",
-        problem: "The queue claims a READY task into IN_PROGRESS atomically, yet nothing requeues it if the executing process dies before REVIEW is recorded today.",
+        problem: "An in-transaction candidate followed by a zero-row claim UPDATE is an invariant violation.",
         rationale: "An explicitly pinned claim invariant keeps the single-step runner contract observable.",
         evidence: [
           {
             file: "src/queue.ts",
-            symbol: "dequeue",
-            observation: "the claim updates status and attempts but no recovery pass requeues orphans",
+            symbol: "claimTask",
+            observation: "an in-transaction candidate followed by a zero-row claim UPDATE is an invariant violation",
           },
         ],
-        approach: "Record the invariant in the dequeue contract comment and pin it with an existing queue test.",
+        approach: "Record the invariant in the claimTask contract comment and pin it with an existing queue test.",
         outcome: "The claim semantics are explicit and enforced by the current test suite.",
         priority: 6,
         complexity: "low",
@@ -913,7 +913,7 @@ test(
           `area tests: ok (1 proposals, 0 rejected)`,
           `[6] (low) Document the queue claim invariant`,
           `  evidence: src/queue.ts`,
-          `  problem: The queue claims a READY task into IN_PROGRESS atomically, yet nothing requeues it if the executing process dies before REVIEW is recorded today.`,
+          `  problem: An in-transaction candidate followed by a zero-row claim UPDATE is an invariant violation.`,
           `  verify: npm test`,
           `dry run — nothing was persisted`,
         ].join("\n") + "\n",

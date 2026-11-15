@@ -24,6 +24,7 @@ import {
   type AreaResult,
 } from "./discovery.ts";
 import { planDiscoveredTasks, type PlanReportEntry, type PlanMeta } from "./planner.ts";
+import { auditProposals } from "./auditor.ts";
 import { persistProposals } from "./persist.ts";
 import { runCycle } from "./cycle.ts";
 import { LifecycleLogger, type LifecycleEvent } from "./lifecycle.ts";
@@ -777,6 +778,17 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
       await discoveryAdapter.close();
     }
 
+    // The auditor runs exactly once on the globally deduplicated proposal
+    // set, immediately after discovery and before either output or
+    // persistence. It is deterministic, read-only and filesystem-only — no
+    // model call, no agent, no writes. Its verdicts are merged into the run's
+    // `rejected` channel and are never persisted themselves.
+    const audited = auditProposals(result, config.projectDirectory);
+    // Verdicts are execution-local: the auditor's `rejected` channel is folded
+    // into the run's existing `rejected` array, and nothing is persisted.
+    result.proposals = audited.proposals;
+    result.rejected = audited.rejected;
+
     for (const area of result.areas) {
       process.stdout.write(
         `area ${area.area}: ${area.status === "ok" ? `ok (${area.proposals.length} proposals, ${area.rejected.length} rejected)` : `ERROR — ${area.error ?? "unknown"}`}\n`,
@@ -1016,16 +1028,16 @@ function tasks(args: string[]): void {
 export const MOCK_DISCOVERY_REPLY = JSON.stringify([
   {
     title: "Document the queue claim invariant",
-    problem: "The queue claims a READY task into IN_PROGRESS atomically, yet nothing requeues it if the executing process dies before REVIEW is recorded today.",
+    problem: "An in-transaction candidate followed by a zero-row claim UPDATE is an invariant violation.",
     rationale: "An explicitly pinned claim invariant keeps the single-step runner contract observable.",
     evidence: [
       {
         file: "src/queue.ts",
-        symbol: "dequeue",
-        observation: "the claim updates status and attempts but no recovery pass requeues orphans",
+        symbol: "claimTask",
+        observation: "an in-transaction candidate followed by a zero-row claim UPDATE is an invariant violation",
       },
     ],
-    approach: "Record the invariant in the dequeue contract comment and pin it with an existing queue test.",
+    approach: "Record the invariant in the claimTask contract comment and pin it with an existing queue test.",
     outcome: "The claim semantics are explicit and enforced by the current test suite.",
     priority: 6,
     complexity: "low",
