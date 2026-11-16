@@ -1881,6 +1881,89 @@ test("discover keeps accepted proposals when the adapter also returns rejected o
   }
 });
 
+/** A proposal the auditor rejects on grounding: the cited symbol `claimTask`
+ *  does exist in src/queue.ts, but the observation's key term ("redis") does
+ *  not appear in the file at all (src/auditor.ts: groundedIn). */
+function groundingRejectedProposal(title: string): unknown {
+  return {
+    title,
+    problem: "A lease that expires without renewal leaves a task orphaned in IN_PROGRESS.",
+    rationale: "The lease must be renewed before it expires or the task is lost.",
+    evidence: [
+      {
+        file: "src/queue.ts",
+        symbol: "claimTask",
+        observation: "the queue persists the claim in redis so a lease can be inspected",
+      },
+    ],
+    approach: "Add lease renewal before expiry in the claim path.",
+    outcome: "Leases are renewed before they expire and tasks are not orphaned.",
+    priority: 5,
+    complexity: "medium",
+    verification: ["npm test"],
+  };
+}
+
+test("discover --dry-run --area quality prints the post-audit rejection (no lifecycle)", async () => {
+  const { dbPath, home } = tempTarget();
+  const stub = await startDiscoveryStub(
+    JSON.stringify([groundingRejectedProposal("Claim the lease before it expires")]),
+  );
+  try {
+    const r = await runStubbed("discover", ["--dry-run", "--area", "quality"], dbPath, home, stub.url);
+    assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.stderr, "");
+    assert.equal(r.stdout, `area quality: ok (0 proposals, 1 rejected)\nno proposals (dry run — nothing was persisted)\n  rejected: Claim the lease before it expires — observation in src/queue.ts is not supported by the file's contents\n`);
+  } finally {
+    await stub.close();
+  }
+});
+
+test("discover --dry-run --area quality --lifecycle logs the audit-completed event with final counts", async () => {
+  const { dbPath, home } = tempTarget();
+  const stub = await startDiscoveryStub(
+    JSON.stringify([groundingRejectedProposal("Claim the lease before it expires")]),
+  );
+  try {
+    const r = await runStubbed("discover", ["--dry-run", "--area", "quality", "--lifecycle"], dbPath, home, stub.url);
+    assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.stderr, "");
+    const lifecycleLines = r.stdout.split("\n").filter((l) => l.startsWith("[") && /\] /.test(l));
+    // The engine logs its run/area/model-request/parse lifecycle events first;
+    // the audit-completed event is appended last, carrying the final counts.
+    assert.equal(lifecycleLines.length, 8);
+    assert.match(lifecycleLines[lifecycleLines.length - 1] ?? "", /^\[\d\d:\d\d:\d\d\] INFO  discover\s+audit\s+completed accepted=0 rejected=1$/);
+    assert.equal(lifecycleLines[lifecycleLines.length - 1], lifecycleLines[lifecycleLines.length - 1], "the audit event is the last lifecycle line");
+  } finally {
+    await stub.close();
+  }
+});
+
+test("discover --dry-run --area 'quality,tests' attributes the rejection to every area that reports it", async () => {
+  const { dbPath, home } = tempTarget();
+  const stub = await startDiscoveryStub(
+    JSON.stringify([groundingRejectedProposal("Claim the lease before it expires")]),
+  );
+  try {
+    const r = await runStubbed("discover", ["--dry-run", "--area", "quality,tests"], dbPath, home, stub.url);
+    assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.equal(r.stderr, "");
+    const lines = r.stdout.split("\n");
+    // The proposal is reported by both areas, so the auditor rejects it in
+    // each one: both channels are drained and each area reports the same
+    // rejection. The run-level duplicate verdict is reported once, at run
+    // level.
+    assert.match(lines[0] ?? "", /^area tests: ok \(0 proposals, 1 rejected\)$/);
+    assert.match(lines[1] ?? "", /^area quality: ok \(0 proposals, 1 rejected\)$/);
+    assert.equal(lines[2], "no proposals (dry run — nothing was persisted)", "dry run prints no run summary");
+    assert.match(lines[3] ?? "", /^  rejected: Claim the lease before it expires — duplicate primary file src\/queue\.ts in this run$/);
+    assert.match(lines[4] ?? "", /^  rejected: Claim the lease before it expires — observation in src\/queue\.ts is not supported by the file's contents$/);
+    assert.equal(lines[5], "", "no trailing output");
+  } finally {
+    await stub.close();
+  }
+});
+
 /** A proposal the engine's validateProposal accepts (its evidence file exists
  *  and the observation is well-formed) but the auditor rejects: the cited
  *  symbol does not appear in the file it cites (src/auditor.ts: evidence
@@ -1924,7 +2007,7 @@ test("discover re-persists the audited manifest with only VALID proposals", asyn
     const r = await runStubbed("discover", ["--area", "architecture"], dbPath, home, stub.url);
     assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
     assert.equal(r.stderr, "");
-    assert.match(r.stdout, /^area architecture: ok \(2 proposals, 0 rejected\)/);
+    assert.match(r.stdout, /^area architecture: ok \(1 proposals, 1 rejected\)/);
 
     // the manifest carries only the VALID proposal: the auditor-rejected one
     // must not survive into the accepted set
@@ -2000,7 +2083,11 @@ test("discover --dry-run still creates no manifest after the post-audit re-persi
     const r = await runStubbed("discover", ["--dry-run", "--area", "architecture"], dbPath, home, stub.url);
     assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
     assert.equal(r.stderr, "");
-    assert.match(r.stdout, /^area architecture: ok \(2 proposals, 0 rejected\)/);
+    // The area header reports the POST-audit state, which is what the
+    // reconciliation makes it agree with: the rejected proposal has left the
+    // accepted channel and is counted as rejected. (The old expectation of
+    // "2 proposals, 0 rejected" was the pre-audit count this fix removes.)
+    assert.match(r.stdout, /^area architecture: ok \(1 proposals, 1 rejected\)/);
     assert.match(r.stdout, /^dry run — nothing was persisted$/m);
 
     // A dry run must never write the run manifest, even though the CLI now

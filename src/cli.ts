@@ -23,6 +23,7 @@ import {
   selectAreas,
   validateRequestedAreas,
   type AreaResult,
+  type RejectedProposal,
 } from "./discovery.ts";
 import { planDiscoveredTasks, type PlanReportEntry, type PlanMeta } from "./planner.ts";
 import { auditProposals } from "./auditor.ts";
@@ -789,6 +790,55 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
     // into the run's existing `rejected` array, and nothing is persisted.
     result.proposals = audited.proposals;
     result.rejected = audited.rejected;
+
+    // Reconcile the per-area channels with the post-audit verdicts. The audit
+    // rejections carry their owning area, so the same proposal objects are
+    // moved from the owning area's accepted channel into that area's rejected
+    // channel — preserving area attribution, the auditor's reason and the raw
+    // title — instead of only replacing the top-level arrays.
+    {
+      const auditRejections = audited.rejected;
+      // Each Proposal object is owned by the first area that reported it
+      // (cross-area dedupe keeps the first occurrence). Only that area's
+      // accepted channel is drained, so a rejected proposal is never counted
+      // twice across areas.
+      const ownedBy: Map<Proposal, string> = new Map();
+      for (const area of result.areas) {
+        for (const proposal of area.proposals) {
+          if (!ownedBy.has(proposal)) ownedBy.set(proposal, area.area);
+        }
+      }
+      // The rejection is matched by the proposal's raw title, not by the
+      // rejection's own `area` field: that field is derived from the cited
+      // evidence file (auditor.ts:areaFromPath), which need not be the area
+      // that generated the proposal.
+      const rejectedByTitle = new Map<string, RejectedProposal>();
+      for (const rejection of auditRejections) {
+        if (rejection.area === "cross-area") continue;
+        rejectedByTitle.set(rejection.raw, rejection);
+      }
+      for (const area of result.areas) {
+        const moved: Proposal[] = [];
+        area.proposals = area.proposals.filter((proposal) => {
+          // Only drain the proposal's owning area; other areas keep the
+          // cross-area duplicate in their own accepted channel.
+          if (ownedBy.get(proposal) !== area.area || rejectedByTitle.has(proposal.title) === false) return true;
+          moved.push(proposal);
+          return false;
+        });
+        for (const proposal of moved) {
+          const rejection = rejectedByTitle.get(proposal.title);
+          if (rejection !== undefined) {
+            area.rejected.push(rejection);
+          }
+        }
+      }
+    }
+
+    lifecycle?.log("INFO", "discover", "audit", "completed", {
+      accepted: result.proposals.length,
+      rejected: result.rejected.length,
+    });
 
     // The manifest was written by engine.run() BEFORE the auditor ran, so it
     // still carries the pre-audit proposal set. Re-persist the audited result
