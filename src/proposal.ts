@@ -348,12 +348,14 @@ export function validateProposal(raw: unknown, repoDir: string): ValidatedPropos
   let dependencies: string[] | undefined;
   if (v.dependencies !== undefined) {
     if (!Array.isArray(v.dependencies)) return { ok: false, reason: "dependencies must be an array of task titles" };
+    // Empty after filtering (e.g. the prompt's documented "omit the field or
+    // use [] when there are none") means "no dependencies": accepted, and
+    // equivalent to an omitted field for the planner (resolveDependencies
+    // treats undefined and [] identically). Only a non-array is a contract
+    // violation.
     dependencies = v.dependencies
       .filter((d): d is string => typeof d === "string" && d.trim().length > 0)
       .map((d) => d.trim());
-    if (dependencies.length === 0) {
-      return { ok: false, reason: "dependencies must contain at least one non-empty entry" };
-    }
   }
 
   const risks = typeof v.risks === "string" && v.risks.trim().length > 0 ? v.risks.trim() : undefined;

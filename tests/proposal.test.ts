@@ -349,3 +349,62 @@ test("duplicate detection uses token similarity", () => {
   assert.equal(isDuplicateTitle("Guard evaluator against NaN samples", ["Guard evaluator against NaN CPU samples"]), true);
   assert.equal(isDuplicateTitle("Cache database connections", ["Handle file watcher events"]), false);
 });
+
+test("dependencies contract: an empty array is accepted as no dependencies", () => {
+  const repo = tmpRepo();
+  try {
+    const validated = validateProposal(makeProposal({ dependencies: [] }), repo);
+    assert.equal(validated.ok, true);
+    assert.deepEqual(validated.proposal?.dependencies, []);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("dependencies contract: omitted dependencies are accepted and stay undefined", () => {
+  const repo = tmpRepo();
+  try {
+    const validated = validateProposal(makeProposal(), repo);
+    assert.equal(validated.ok, true);
+    assert.equal(validated.proposal?.dependencies, undefined);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("dependencies contract: empty and whitespace-only entries are accepted as an empty list", () => {
+  const repo = tmpRepo();
+  try {
+    const validated = validateProposal(makeProposal({ dependencies: ["", "   "] }), repo);
+    assert.equal(validated.ok, true);
+    assert.deepEqual(validated.proposal?.dependencies, []);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("dependencies contract: mixed valid and empty entries keep only trimmed titles", () => {
+  const repo = tmpRepo();
+  try {
+    const validated = validateProposal(makeProposal({ dependencies: ["  Add system-CPU sampling  ", "   ", ""] }), repo);
+    assert.equal(validated.ok, true);
+    assert.deepEqual(validated.proposal?.dependencies, ["Add system-CPU sampling"]);
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("dependencies contract: null and non-array values stay rejected", () => {
+  const repo = tmpRepo();
+  try {
+    const nullish = validateProposal(makeProposal({ dependencies: null as unknown as string[] }), repo);
+    assert.equal(nullish.ok, false);
+    assert.equal(nullish.reason, "dependencies must be an array of task titles");
+
+    const nonArray = validateProposal(makeProposal({ dependencies: "none" as unknown as string[] }), repo);
+    assert.equal(nonArray.ok, false);
+    assert.equal(nonArray.reason, "dependencies must be an array of task titles");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});

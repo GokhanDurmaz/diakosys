@@ -3,11 +3,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { MockOpenCodeAdapter } from "../src/opencode.ts";
+import { MockOpenCodeAdapter, type OpenCodeAdapter, type OpenCodeAdapterOptions, type OpenCodePromptResult, type TurnStats } from "../src/opencode.ts";
+import type { LifecycleEvent } from "../src/lifecycle.ts";
 import { openDatabase, closeDatabase } from "../src/db.ts";
 import { CoordinatorDisownedError } from "../src/locks.ts";
 import type { DatabaseSync } from "node:sqlite";
 import type { Proposal } from "../src/proposal.ts";
+import { validateProposal } from "../src/proposal.ts";
 import { coordinatorAuth } from "./helpers.ts";
 import {
   DISCOVERY_AREAS,
@@ -958,5 +960,455 @@ test("title-similar proposals from different areas are deduped cross-area with f
   } finally {
     await adapter.close();
     fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+// ——— orphan-turn cleanup after a failed area prompt ———
+// A failed prompt leaves its turn running server-side, and every area shares
+// one OpenCode session: the failed area must interrupt the session BEFORE the
+// next area's prompt is admitted. The stub records the prompt/abort sequence
+// in one journal so the ordering is directly assertable.
+
+/** Scripted outcomes per prompt call; "timeout" rejects with the real v2 deadline error. */
+type PromptOutcome = "timeout" | "reply";
+
+class OrphanTurnAdapter implements OpenCodeAdapter {
+  readonly kind = "mock" as const;
+  readonly options: OpenCodeAdapterOptions = {
+    projectDirectory: "",
+    model: "",
+    agent: undefined,
+    port: undefined,
+    hostname: undefined,
+    startupTimeoutMs: undefined,
+    promptTimeoutMs: undefined,
+    workDirectory: undefined,
+    endpoint: undefined,
+  };
+  /** Ordered record of every prompt and abort phase ("prompt:1", "abort:start", …). */
+  readonly journal: string[] = [];
+  readonly aborted: Array<string | undefined> = [];
+  private readonly outcomes: PromptOutcome[];
+  private readonly abortBehavior: "delayed" | "rejecting" | "hanging";
+  private calls = 0;
+
+  constructor(outcomes: PromptOutcome[], abortBehavior: "delayed" | "rejecting" | "hanging" = "delayed") {
+    this.outcomes = outcomes;
+    this.abortBehavior = abortBehavior;
+  }
+
+  async probe(): Promise<string> {
+    return "orphan-stub:localhost:4096";
+  }
+
+  async prompt(input: {
+    title: string;
+    description: string;
+    directory: string;
+    agent?: string;
+    tools?: Record<string, boolean>;
+  }): Promise<OpenCodePromptResult> {
+    void input;
+    this.calls += 1;
+    const index = this.calls;
+    this.journal.push(`prompt:${index}`);
+    if ((this.outcomes[index - 1] ?? "reply") === "timeout") {
+      // the exact v2 deadline diagnostic shape (src/opencode-v2.ts)
+      throw new Error(`opencode prompt timed out after 420000ms (session ses_stub_001)`);
+    }
+    const text = JSON.stringify([proposal(`Orphan probe ${index}`, 6, "low")]);
+    return {
+      sessionId: "ses_stub_001",
+      finish: "stop",
+      role: "assistant",
+      text,
+      raw: { info: { finish: "stop", role: "assistant" }, parts: [{ type: "text", text }] },
+    };
+  }
+
+  async abort(sessionId?: string): Promise<void> {
+    this.journal.push("abort:start");
+    this.aborted.push(sessionId);
+    if (this.abortBehavior === "rejecting") {
+      throw new Error("interrupt POST failed");
+    }
+    if (this.abortBehavior === "hanging") {
+      return new Promise<void>(() => undefined);
+    }
+    // A realistic interrupt round-trip: long enough that fire-and-forget
+    // cleanup would submit the next area's prompt before the abort completed.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    this.journal.push("abort:end");
+  }
+
+  activeSessionId(): string | undefined {
+    return "ses_stub_001";
+  }
+
+  async close(): Promise<void> {
+    return;
+  }
+}
+
+function orphanEngine(adapter: OpenCodeAdapter, dir: string, cacheDir: string): DiscoveryEngine {
+  return new DiscoveryEngine(adapter, {
+    repoDir: dir,
+    model: MODEL,
+    maxProposalsPerArea: 1,
+    promptTimeoutMs: 5000,
+    cacheDir,
+    areas: ["architecture", "tests"],
+  });
+}
+
+test("a failed area prompt interrupts the shared session before the next area submits", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const adapter = new OrphanTurnAdapter(["timeout", "reply"]);
+  try {
+    const result = await orphanEngine(adapter, dir, cacheDir).run();
+    // the failed area keeps the original prompt error
+    assert.equal(result.areas[0]?.status, "error");
+    assert.match(result.areas[0]?.error ?? "", /opencode prompt timed out after 420000ms \(session ses_stub_001\)/);
+    // the orphan turn was interrupted exactly once
+    assert.deepEqual(adapter.aborted, ["ses_stub_001"]);
+    // and the interrupt COMPLETED before the second area's prompt was admitted
+    const abortEnd = adapter.journal.indexOf("abort:end");
+    const secondPrompt = adapter.journal.indexOf("prompt:2");
+    assert.ok(abortEnd !== -1, `the delayed abort must have completed (journal: ${adapter.journal.join(" → ")})`);
+    assert.ok(
+      abortEnd < secondPrompt,
+      `the abort must complete before the next prompt is submitted (journal: ${adapter.journal.join(" → ")})`,
+    );
+    // discovery continues: the second area still runs and parses
+    assert.equal(result.areas[1]?.status, "ok");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("a rejecting abort must not mask the original prompt error", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const adapter = new OrphanTurnAdapter(["timeout", "reply"], "rejecting");
+  try {
+    const result = await orphanEngine(adapter, dir, cacheDir).run();
+    assert.equal(result.areas[0]?.status, "error");
+    // the reported error is the prompt's, not the abort's
+    assert.match(result.areas[0]?.error ?? "", /opencode prompt timed out after 420000ms \(session ses_stub_001\)/);
+    assert.ok(!(result.areas[0]?.error ?? "").includes("interrupt POST failed"), "the abort failure must stay swallowed");
+    // the abort was still requested, and the next area still ran
+    assert.deepEqual(adapter.aborted, ["ses_stub_001"]);
+    assert.equal(result.areas[1]?.status, "ok");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("a never-settling abort cannot stall discovery past the grace period", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const adapter = new OrphanTurnAdapter(["timeout", "reply"], "hanging");
+  try {
+    const started = Date.now();
+    const result = await orphanEngine(adapter, dir, cacheDir).run();
+    const elapsed = Date.now() - started;
+    // the abort was requested but never answered: the grace period bounds the wait
+    assert.deepEqual(adapter.aborted, ["ses_stub_001"]);
+    assert.ok(elapsed >= 1_950, `the grace period must be honored, resumed after ${elapsed}ms`);
+    assert.ok(elapsed < 8_000, `the grace must bound the wait, took ${elapsed}ms`);
+    // discovery continues after the grace period
+    assert.equal(result.areas[1]?.status, "ok");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+// ——— turn-statistics lifecycle emission (observability only) ———
+// The v2 backend attaches one aggregated TurnStats snapshot to each prompt's
+// result or rejection; runArea emits it as exactly ONE lifecycle event per
+// prompt. These tests use a stub that mirrors that contract without a server.
+
+/** A representative completed-turn snapshot, overridden per test. */
+function turnStatsFixture(overrides: Partial<TurnStats> = {}): TurnStats {
+  return {
+    sessionId: "ses_stub_001",
+    outcome: "completed",
+    terminalEvent: "session.status",
+    wallMs: 1_234,
+    steps: 2,
+    firstStepAtMs: 15,
+    lastEventAtMs: 1_100,
+    toolCalls: { read: 2 },
+    toolSpanMs: 40,
+    unattributedSpanMs: 1_194,
+    tokens: { input: 100, output: 50, reasoning: 20, cacheRead: 10, cacheWrite: 5 },
+    finishReasons: ["tool-calls", "stop"],
+    retries: 0,
+    ...overrides,
+  };
+}
+
+/** Scripted adapter that attaches fixed snapshots to its prompt outcomes,
+ *  mirroring the v2 backend's instrumentation contract (the timeout error
+ *  carries the partial snapshot; the result carries the completed one). */
+class StatsCarrierAdapter implements OpenCodeAdapter {
+  readonly kind = "mock" as const;
+  readonly options: OpenCodeAdapterOptions = {
+    projectDirectory: "",
+    model: "",
+    agent: undefined,
+    port: undefined,
+    hostname: undefined,
+    startupTimeoutMs: undefined,
+    promptTimeoutMs: undefined,
+    workDirectory: undefined,
+    endpoint: undefined,
+  };
+  private readonly outcomes: Array<"fail" | "ok">;
+  private readonly failStats: TurnStats | undefined;
+  private readonly okStats: TurnStats | undefined;
+  private calls = 0;
+
+  constructor(outcomes: Array<"fail" | "ok">, stats: { fail?: TurnStats; ok?: TurnStats } = {}) {
+    this.outcomes = outcomes;
+    this.failStats = stats.fail;
+    this.okStats = stats.ok;
+  }
+
+  async probe(): Promise<string> {
+    return "stats-stub:localhost:4096";
+  }
+
+  async prompt(input: {
+    title: string;
+    description: string;
+    directory: string;
+    agent?: string;
+    tools?: Record<string, boolean>;
+  }): Promise<OpenCodePromptResult> {
+    void input;
+    this.calls += 1;
+    if ((this.outcomes[this.calls - 1] ?? "ok") === "fail") {
+      // the exact v2 deadline diagnostic shape, carrying the partial snapshot
+      throw Object.assign(
+        new Error("opencode prompt timed out after 420000ms (session ses_stub_001)"),
+        this.failStats === undefined ? {} : { turnStats: this.failStats },
+      );
+    }
+    const text = JSON.stringify([proposal("Stats carrier proposal", 5, "low")]);
+    return {
+      sessionId: "ses_stub_001",
+      finish: "stop",
+      role: "assistant",
+      text,
+      raw: { info: { finish: "stop", role: "assistant" }, parts: [{ type: "text", text }] },
+      ...(this.okStats === undefined ? {} : { turnStats: this.okStats }),
+    };
+  }
+
+  async abort(): Promise<void> {
+    return;
+  }
+
+  activeSessionId(): string | undefined {
+    return "ses_stub_001";
+  }
+
+  async close(): Promise<void> {
+    return;
+  }
+}
+
+function statsEngine(
+  adapter: OpenCodeAdapter,
+  dir: string,
+  cacheDir: string,
+  events: LifecycleEvent[],
+): DiscoveryEngine {
+  return new DiscoveryEngine(adapter, {
+    repoDir: dir,
+    model: MODEL,
+    maxProposalsPerArea: 1,
+    promptTimeoutMs: 5_000,
+    cacheDir,
+    areas: ["architecture", "tests"],
+    onLifecycle: (event) => events.push(event),
+  });
+}
+
+test("a completed prompt emits exactly one turn-stats event per prompt with area context", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const events: LifecycleEvent[] = [];
+  const adapter = new StatsCarrierAdapter(["ok", "ok"], { ok: turnStatsFixture() });
+  try {
+    const result = await statsEngine(adapter, dir, cacheDir, events).run();
+    assert.equal(result.areas.length, 2);
+    const statsEvents = events.filter((e) => e.event === "turn-stats");
+    assert.equal(statsEvents.length, 2, "exactly one aggregated event per prompt, none per SSE event");
+    const first = statsEvents[0] as unknown as Record<string, unknown>;
+    assert.equal(statsEvents[0]?.level, "INFO");
+    assert.equal(statsEvents[0]?.stage, "model-request");
+    assert.equal(statsEvents[0]?.areaId, "architecture", "the event carries the discovery areaId");
+    assert.equal(first.sessionId, "ses_stub_001");
+    assert.equal(first.outcome, "completed");
+    assert.equal(first.terminalEvent, "session.status");
+    assert.equal(first.steps, 2);
+    assert.equal(first.wallMs, 1_234);
+    assert.equal(first.firstStepAtMs, 15);
+    assert.equal(first.toolCalls, "read:2", "grouped counts render compactly");
+    assert.equal(first.toolSpanMs, 40);
+    assert.equal(first.unattributedSpanMs, 1_194);
+    assert.equal(first.tokensInput, 100);
+    assert.equal(first.tokensOutput, 50);
+    assert.equal(first.tokensReasoning, 20);
+    assert.equal(first.tokensCacheRead, 10);
+    assert.equal(first.tokensCacheWrite, 5);
+    assert.equal(first.finishReasons, "tool-calls,stop");
+    assert.equal(first.retries, 0);
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("a failed prompt emits one turn-stats event and keeps the original error verdict", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const events: LifecycleEvent[] = [];
+  const adapter = new StatsCarrierAdapter(["fail", "ok"], {
+    fail: turnStatsFixture({ outcome: "timeout", terminalEvent: "deadline", steps: 4, toolCalls: { read: 3 }, tokens: null, finishReasons: null }),
+    ok: turnStatsFixture(),
+  });
+  try {
+    const result = await statsEngine(adapter, dir, cacheDir, events).run();
+    assert.equal(result.areas[0]?.status, "error");
+    assert.match(result.areas[0]?.error ?? "", /opencode prompt timed out after 420000ms \(session ses_stub_001\)/);
+    const statsEvents = events.filter((e) => e.event === "turn-stats");
+    assert.equal(statsEvents.length, 2, "the failed prompt emitted its own single event");
+    const failed = statsEvents[0] as unknown as Record<string, unknown>;
+    assert.equal(failed.areaId, "architecture");
+    assert.equal(failed.outcome, "timeout");
+    assert.equal(failed.terminalEvent, "deadline");
+    assert.equal(failed.steps, 4);
+    assert.equal(failed.toolCalls, "read:3");
+    assert.ok(!("tokensInput" in failed) || failed.tokensInput === undefined, "missing token data is omitted, not zero");
+    assert.ok(!("finishReasons" in failed) || failed.finishReasons === undefined, "missing finish reasons are omitted");
+    // the existing ERROR verdict still fires alongside the stats event
+    const errorEvent = events.find((e) => e.event === "error" && e.level === "ERROR");
+    assert.ok(errorEvent !== undefined, "the pre-existing error lifecycle event is unchanged");
+    assert.match(errorEvent.error ?? "", /opencode prompt timed out after 420000ms/);
+    // the second area's prompt emitted its own completed event
+    assert.equal(statsEvents[1] && (statsEvents[1] as unknown as Record<string, unknown>).outcome, "completed");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("adapters without turn statistics emit no turn-stats event", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const events: LifecycleEvent[] = [];
+  const adapter = new MockOpenCodeAdapter(() => JSON.stringify([proposal("Mock proposal", 5, "low")]));
+  try {
+    const result = await statsEngine(adapter, dir, cacheDir, events).run();
+    assert.ok(result.areas.every((a) => a.status === "ok"), "the run itself is unchanged");
+    assert.equal(events.filter((e) => e.event === "turn-stats").length, 0, "no snapshot → no emission");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("a throwing lifecycle observer cannot mask the original prompt error", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const events: LifecycleEvent[] = [];
+  const adapter = new StatsCarrierAdapter(["fail", "ok"], {
+    fail: turnStatsFixture({ outcome: "timeout", terminalEvent: "deadline" }),
+    ok: turnStatsFixture(),
+  });
+  const engine = new DiscoveryEngine(adapter, {
+    repoDir: dir,
+    model: MODEL,
+    maxProposalsPerArea: 1,
+    promptTimeoutMs: 5_000,
+    cacheDir,
+    areas: ["architecture", "tests"],
+    onLifecycle: (event) => {
+      if (event.event === "turn-stats") throw new Error("observer exploded");
+      events.push(event);
+    },
+  });
+  try {
+    const result = await engine.run();
+    assert.equal(result.areas[0]?.status, "error");
+    assert.match(result.areas[0]?.error ?? "", /opencode prompt timed out after 420000ms/, "the original error message survives the instrumentation failure");
+    assert.equal(result.areas[1]?.status, "ok", "the observer failure stays swallowed and discovery continues");
+    assert.equal(events.filter((e) => e.event === "turn-stats").length, 0, "the failed emissions never surface");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("a complete proposal with an empty dependencies array is accepted end-to-end", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  // the prompt documents "omit the field or use [] when there are none" —
+  // the example shape the model is told to copy ends with "dependencies": [],
+  // so the exact form it produces must survive validation (regression for the
+  // former "dependencies must contain at least one non-empty entry" rejection)
+  const adapter = new MockOpenCodeAdapter(() =>
+    JSON.stringify([{ ...proposal("Guard evaluator against NaN samples", 6, "low"), dependencies: [] }]),
+  );
+  try {
+    const discovery = new DiscoveryEngine(adapter, {
+      repoDir: dir,
+      model: MODEL,
+      maxProposalsPerArea: 1,
+      promptTimeoutMs: 5_000,
+      cacheDir,
+      areas: ["tests"],
+    });
+    const result = await discovery.run();
+    assert.equal(result.areas[0]?.status, "ok");
+    assert.equal(result.areas[0]?.rejected.length, 0, "no rejection may be reported for the documented empty form");
+    assert.equal(result.areas[0]?.proposals.length, 1);
+    assert.deepEqual(result.areas[0]?.proposals[0]?.dependencies, []);
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("the example JSON embedded in the discovery prompt passes validateProposal", () => {
+  // drift guard: the prompt teaches a concrete example shape; if either the
+  // example or the validator changes, this test fails before a discovery run
+  // wastes a full model turn on proposals that would all be rejected
+  const dir = tmpRepo();
+  try {
+    // the example cites src/queue.ts as its evidence file; it must exist for
+    // the example to validate
+    fs.writeFileSync(path.join(dir, "src/queue.ts"), "export function executeNext(limit: number): void {}\n");
+    const prompt = areaInstruction({ key: "tests", focus: "Missing or weak test coverage." }, 3, "src/queue.ts");
+    const marker = "in the shape of this example:";
+    const markerAt = prompt.indexOf(marker);
+    assert.ok(markerAt >= 0, "the prompt must still introduce the example");
+    const exampleStart = prompt.indexOf('{"title"', markerAt);
+    assert.ok(exampleStart > markerAt, "the example object must follow the example marker");
+    const lineEnd = prompt.indexOf("\n", exampleStart);
+    const exampleLine = prompt.slice(exampleStart, lineEnd === -1 ? undefined : lineEnd).trim();
+    const parsed: unknown = JSON.parse(exampleLine);
+    const validated = validateProposal(parsed, dir);
+    assert.equal(validated.ok, true, `the prompt's own example must validate: ${validated.reason ?? ""}`);
+    assert.deepEqual(validated.proposal?.dependencies, [], "the example demonstrates the documented empty form");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

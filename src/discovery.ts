@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { OpenCodeAdapter, OpenCodePromptResult } from "./opencode.ts";
+import type { OpenCodeAdapter, OpenCodePromptResult, TurnStats } from "./opencode.ts";
 import type { LifecycleLevel, LifecycleEvent } from "./lifecycle.ts";
 import { withWriteTx } from "./tx.ts";
 import { coordinatorGuardTxn, type CoordinatorAuthority } from "./locks.ts";
@@ -587,6 +587,33 @@ export function areaInstruction(area: DiscoveryArea, maxProposals: number, manif
   ].join("\n");
 }
 
+/**
+ * Bound on the orphan-turn interrupt wait after a failed area prompt.
+ *
+ * A failed prompt leaves its turn running server-side (v2 admits the input and
+ * executes asynchronously), and every area shares one session — so the next
+ * area's prompt must not be admitted before the interrupt has landed. The
+ * wait is bounded so an unresponsive server cannot stall the error path:
+ * when the grace elapses the run continues and the (dangling) abort result
+ * is discarded by the caller regardless.
+ */
+const DISCOVERY_ABORT_GRACE_MS = 2_000;
+
+/** Turn statistics attached to a prompt result/rejection by the v2 backend
+ *  (opencode-v2.ts); other adapters and ordinary errors carry none. */
+function extractTurnStats(err: unknown): TurnStats | undefined {
+  const carrier = err as { turnStats?: TurnStats } | undefined | null;
+  return typeof carrier === "object" && carrier !== null ? carrier.turnStats : undefined;
+}
+
+/** Compact `name:count` rendering of the grouped tool-call counts; undefined
+ *  when no tool call was observed (absent, not zero). */
+function formatToolCalls(toolCalls: Record<string, number>): string | undefined {
+  const entries = Object.entries(toolCalls);
+  if (entries.length === 0) return undefined;
+  return entries.map(([name, count]) => `${name}:${count}`).join(",");
+}
+
 /** Aggregates raw adapter errors so tests can exercise model-failure paths. */
 export class DiscoveryEngine {
   private adapter: OpenCodeAdapter;
@@ -612,6 +639,42 @@ export class DiscoveryEngine {
       event,
       ...extra,
     });
+  }
+
+  /**
+   * Emit the ONE aggregated, privacy-safe turn-statistics event for a prompt
+   * attempt through the existing lifecycle channel (never one line per SSE
+   * event). Missing snapshots (v1/mock adapters, parse failures after a
+   * successful prompt) emit nothing, null metrics are omitted rather than
+   * rendered as zeros, and an observing sink that throws must never alter
+   * the area result — the try/catch keeps this strictly observational.
+   */
+  private emitTurnStats(stats: TurnStats | undefined, areaId: string): void {
+    if (stats === undefined) return;
+    try {
+      this.lifecycle("INFO", "model-request", "turn-stats", {
+        areaId,
+        sessionId: stats.sessionId,
+        outcome: stats.outcome,
+        terminalEvent: stats.terminalEvent ?? undefined,
+        wallMs: stats.wallMs ?? undefined,
+        steps: stats.steps,
+        firstStepAtMs: stats.firstStepAtMs ?? undefined,
+        lastEventAtMs: stats.lastEventAtMs ?? undefined,
+        toolCalls: formatToolCalls(stats.toolCalls),
+        toolSpanMs: stats.toolSpanMs ?? undefined,
+        unattributedSpanMs: stats.unattributedSpanMs ?? undefined,
+        tokensInput: stats.tokens?.input,
+        tokensOutput: stats.tokens?.output,
+        tokensReasoning: stats.tokens?.reasoning,
+        tokensCacheRead: stats.tokens?.cacheRead,
+        tokensCacheWrite: stats.tokens?.cacheWrite,
+        finishReasons: stats.finishReasons === null ? undefined : stats.finishReasons.join(","),
+        retries: stats.retries,
+      });
+    } catch {
+      // ignore: the lifecycle channel must never break the area it observes
+    }
   }
 
   async run(): Promise<DiscoveryResult> {
@@ -735,6 +798,30 @@ export class DiscoveryEngine {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // The failed prompt's turn may still be executing server-side. Interrupt
+      // the active session BEFORE this area returns, so the next area's prompt
+      // is never admitted into a still-busy shared session. The wait is
+      // bounded (DISCOVERY_ABORT_GRACE_MS) so an unresponsive server cannot
+      // stall the error path, and an abort failure is swallowed so it can
+      // never replace `message`. The adapter contract reports a completed
+      // no-op for an already-idle session (an `interrupted: false` response
+      // body) — that is a success, not an error, and the response is
+      // discarded by design.
+      const sessionId = this.adapter.activeSessionId();
+      if (sessionId !== undefined) {
+        let clearGrace: () => void = () => {};
+        await Promise.race([
+          this.adapter.abort(sessionId).catch(() => undefined),
+          new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, DISCOVERY_ABORT_GRACE_MS);
+            clearGrace = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+          }),
+        ]).finally(() => clearGrace());
+      }
+      this.emitTurnStats(extractTurnStats(err), area.key);
       this.lifecycle("ERROR", "model-request", "error", { areaId: area.key, error: message });
       this.lifecycle("INFO", "area", "completed", {
         areaId: area.key,
@@ -752,6 +839,7 @@ export class DiscoveryEngine {
         evidence: [],
       };
     }
+    this.emitTurnStats(response.turnStats, area.key);
     this.lifecycle("INFO", "model-request", "completed", {
       areaId: area.key,
       durationMs: Date.now() - areaStartedAt,

@@ -33,6 +33,63 @@ export interface OpenCodePromptResult {
     info: { finish?: string; role?: string } | undefined;
     parts: unknown[];
   };
+  /** Present for v2 prompts only: one aggregated, privacy-safe turn-statistics
+   * snapshot collected from the SSE events the prompt already receives
+   * (opencode-v2.ts). Other adapters omit it, and consumers may ignore it. */
+  turnStats?: TurnStats;
+}
+
+/**
+ * Privacy-safe, aggregated statistics for one prompt turn, collected by the
+ * v2 backend from the SSE event stream it already subscribes to — no extra
+ * model or HTTP request, and no effect on prompt behavior, results or
+ * timeouts.
+ *
+ * Counts are OBSERVATIONS from received events: on a timed-out turn they can
+ * be incomplete. Derived spans and token sums are `null` when no datapoint
+ * was observed, so a missing measurement is never reported as a measured
+ * zero. Only names, counts, durations, token numbers and event types are
+ * recorded — never prompt, response, reasoning or tool input/output content.
+ */
+export interface TurnStats {
+  sessionId: string;
+  /** How the turn ended from the client's perspective: a terminal event was
+   * reached ("completed"), a stream/execution error surfaced ("error"), or
+   * the client deadline won ("timeout"). */
+  outcome: "completed" | "error" | "timeout";
+  /** Event type that ended the turn; `"deadline"` when the client deadline
+   * won; null when no terminal event was observed. */
+  terminalEvent: string | null;
+  /** Local wall time from prompt start to snapshot emission; null when
+   * unmeasurable. */
+  wallMs: number | null;
+  /** Observed agent steps: distinct `step-start` parts, falling back to
+   * `session.step.started` events when no part was observed. */
+  steps: number;
+  /** ms from prompt start to the first observed step start; null when no
+   * step was observed. */
+  firstStepAtMs: number | null;
+  /** ms from prompt start to the last received event; null when no event
+   * was received. */
+  lastEventAtMs: number | null;
+  /** Observed distinct tool calls grouped by tool name (empty object = none
+   * observed). */
+  toolCalls: Record<string, number>;
+  /** Sum of completed tool-call durations (server-side timestamps); null
+   * when no call reported both a start and an end. */
+  toolSpanMs: number | null;
+  /** wallMs minus toolSpanMs: time NOT attributed to a measured tool
+   * execution — model generation, streaming, gaps between steps. It is NOT
+   * pure model-generation time; null when either side is unknown. */
+  unattributedSpanMs: number | null;
+  /** Per-step usage summed over observed step finishes (the canonical
+   * per-step source; aggregate usage events are never added on top); null
+   * when no step reported usage. */
+  tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number } | null;
+  /** Per-step finish reasons in observed order; null when none observed. */
+  finishReasons: string[] | null;
+  /** Highest retry attempt observed on `session.status`. */
+  retries: number;
 }
 
 export interface OpenCodeAdapter {

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { LiveOpenCodeAdapter } from "../src/opencode.ts";
+import { LiveOpenCodeAdapter, type TurnStats } from "../src/opencode.ts";
 import { toOpencodeError } from "../src/opencode-v2.ts";
 import { installFakeSpawn } from "./fake-opencode-spawn.ts";
 
@@ -87,6 +87,10 @@ interface StubOptions {
    * server's contract: `order=asc` → chronological, anything else (including
    * the parameter's absence) → newest-first. */
   assistantMessages?: Array<{ finish?: string; text?: string }>;
+  /** Scripted SSE events, sent in order as `data:` lines when the stream
+   * opens. In "idle" mode they precede the terminal session.status event;
+   * in "hold" mode they are the only body bytes (no terminal event). */
+  sseEvents?: Array<unknown>;
 }
 
 interface StubHandle {
@@ -199,16 +203,24 @@ async function startStub(options: StubOptions = {}): Promise<StubHandle> {
         });
         if (options.sseMode === "hold") {
           // Headers only: flush them now and hold the stream open forever —
-          // no body byte is ever sent, so a subscriber never sees a terminal
-          // event. (writeHead alone never reaches the wire; the probe verified
+          // no terminal event is ever sent, so a subscriber never completes.
+          // Scripted events (when present) are still delivered first, so a
+          // prompt can observe partial activity before its deadline.
+          // (writeHead alone never reaches the wire; the probe verified
           // that flushHeaders() is required for the client to see the stream.)
           res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
           res.flushHeaders();
+          for (const event of options.sseEvents ?? []) {
+            res.write(`data: ${JSON.stringify(event)}\n\n`);
+          }
           return;
         }
         const contentType = options.sseContentType ?? "text/event-stream";
         res.writeHead(200, { "content-type": contentType, "cache-control": "no-cache" });
         if (contentType === "text/event-stream") {
+          for (const event of options.sseEvents ?? []) {
+            res.write(`data: ${JSON.stringify(event)}\n\n`);
+          }
           res.write(`data: ${JSON.stringify({ type: "session.status", data: { status: "idle" } })}\n\n`);
           // End shortly after so the abandoned SSE iterator completes cleanly.
           sseTimers.push(setTimeout(() => res.end(), 250));
@@ -652,4 +664,240 @@ test("toOpencodeError falls back to the message for non-ClientError errors", () 
 test("toOpencodeError renders non-Error values with the session id", () => {
   const wrapped = toOpencodeError({ foo: "bar" }, "ses_stub_001");
   assert.equal(wrapped.message, `opencode failed (session ses_stub_001): {"foo":"bar"}`);
+});
+
+// ——— turn statistics (observability only; prompt behavior is unchanged) ———
+// The scripted SSE events mirror the real v2 bus: `message.part.updated`
+// carries the durable per-step/tool parts; `session.step.*` and
+// `session.status` are the dedicated events. All payloads are plain JSON, so
+// the collector's defensive reads are exercised with genuinely malformed data.
+
+/** Extract the turn-stats snapshot a v2 prompt attaches to a rejection. */
+function turnStatsOf(err: unknown): TurnStats | undefined {
+  return err !== null && typeof err === "object" ? (err as { turnStats?: TurnStats }).turnStats : undefined;
+}
+
+const partEvent = (part: Record<string, unknown>): unknown => ({
+  type: "message.part.updated",
+  data: { sessionID: "ses_stub_001", part: { sessionID: "ses_stub_001", messageID: "msg_1", ...part } },
+});
+
+const stepStartPart = (id: string): unknown => partEvent({ id, type: "step-start" });
+
+const stepFinishPart = (id: string, reason: string, tokens?: Record<string, unknown>): unknown =>
+  partEvent({ id, type: "step-finish", reason, ...(tokens === undefined ? {} : { tokens }) });
+
+const toolPart = (callID: string, tool: string, state: Record<string, unknown>): unknown =>
+  partEvent({ id: `prt_${callID}`, type: "tool", callID, tool, state });
+
+test("v2 turn stats: step count and finish reasons from per-step parts", async () => {
+  const stub = await startStub({
+    sseEvents: [
+      stepStartPart("prt_ss1"),
+      stepFinishPart("prt_sf1", "tool-calls", { input: 100, output: 50, reasoning: 20, cache: { read: 10, write: 5 } }),
+      stepStartPart("prt_ss2"),
+      stepFinishPart("prt_sf2", "stop", { input: 200, output: 80, reasoning: 30, cache: { read: 15, write: 6 } }),
+    ],
+  });
+  setHolder(stub.url);
+  const adapter = makeV2Adapter();
+  try {
+    const result = await adapter.prompt({ ...PROMPT_INPUT });
+    assert.equal(result.text, "stub reply", "the prompt result is unchanged by instrumentation");
+    const stats = result.turnStats;
+    assert.ok(stats, "a completed v2 prompt carries a turn-stats snapshot");
+    assert.equal(stats.sessionId, "ses_stub_001");
+    assert.equal(stats.outcome, "completed");
+    assert.equal(stats.terminalEvent, "session.status");
+    assert.equal(stats.steps, 2, "distinct step-start parts, deduped by part id");
+    assert.deepEqual(stats.finishReasons, ["tool-calls", "stop"]);
+    assert.deepEqual(stats.tokens, { input: 300, output: 130, reasoning: 50, cacheRead: 25, cacheWrite: 11 });
+    assert.deepEqual(stats.toolCalls, {});
+    assert.equal(stats.toolSpanMs, null);
+    assert.equal(stats.unattributedSpanMs, null, "no measured tool span → no unattributed attribution");
+    assert.equal(stats.retries, 0);
+    assert.ok(stats.wallMs !== null && stats.wallMs >= 0);
+    assert.ok(stats.firstStepAtMs !== null, "the first step timestamp is measured");
+    assert.ok(stats.lastEventAtMs !== null, "the last event timestamp is measured");
+  } finally {
+    await adapter.close().catch(() => undefined);
+    await stub.close();
+    clearHolder();
+  }
+});
+
+test("v2 turn stats: tool calls counted once per call, durations summed once", async () => {
+  const stub = await startStub({
+    sseEvents: [
+      toolPart("call_1", "read", { status: "pending" }),
+      toolPart("call_1", "read", { status: "running", time: { start: 1_000 } }),
+      toolPart("call_1", "read", { status: "completed", time: { start: 1_000, end: 1_250 } }),
+      // duplicate completion update of the same call: neither the count nor
+      // the duration may be added twice
+      toolPart("call_1", "read", { status: "completed", time: { start: 1_000, end: 1_250 } }),
+      toolPart("call_2", "grep", { status: "completed", time: { start: 2_000, end: 2_050 } }),
+    ],
+  });
+  setHolder(stub.url);
+  const adapter = makeV2Adapter();
+  try {
+    const result = await adapter.prompt({ ...PROMPT_INPUT });
+    const stats = result.turnStats;
+    assert.ok(stats);
+    assert.deepEqual(stats.toolCalls, { read: 1, grep: 1 }, "pending/running/completed updates are one call");
+    assert.equal(stats.toolSpanMs, 300, "250ms + 50ms, the duplicate completion ignored");
+    assert.equal(stats.steps, 0);
+    assert.equal(stats.tokens, null, "no step reported usage");
+    assert.equal(stats.finishReasons, null);
+    assert.ok(stats.unattributedSpanMs !== null, "the unattributed remainder is measurable here");
+  } finally {
+    await adapter.close().catch(() => undefined);
+    await stub.close();
+    clearHolder();
+  }
+});
+
+test("v2 turn stats: per-step usage counted once; aggregates never added on top", async () => {
+  const usage = { input: 10, output: 5, reasoning: 2, cache: { read: 1, write: 0 } };
+  const stub = await startStub({
+    sseEvents: [
+      stepFinishPart("prt_sf1", "stop", usage),
+      // the same step finish updated again (incremental persistence)
+      stepFinishPart("prt_sf1", "stop", usage),
+      // the dedicated step event for the same step — same numbers, different
+      // source: must not be summed on top of the canonical part
+      { type: "session.step.ended", data: { assistantMessageID: "msg_1", finish: "stop", tokens: usage } },
+      // aggregate usage events are ignored entirely
+      { type: "session.usage.updated", data: { cost: 1, tokens: usage } },
+      { type: "message.updated", data: { messageID: "msg_1", tokens: usage } },
+    ],
+  });
+  setHolder(stub.url);
+  const adapter = makeV2Adapter();
+  try {
+    const result = await adapter.prompt({ ...PROMPT_INPUT });
+    const stats = result.turnStats;
+    assert.ok(stats);
+    assert.deepEqual(stats.tokens, { input: 10, output: 5, reasoning: 2, cacheRead: 1, cacheWrite: 0 });
+    assert.deepEqual(stats.finishReasons, ["stop"]);
+  } finally {
+    await adapter.close().catch(() => undefined);
+    await stub.close();
+    clearHolder();
+  }
+});
+
+test("v2 turn stats: step.ended events are the fallback when no step part arrives", async () => {
+  const stub = await startStub({
+    sseEvents: [
+      { type: "session.step.started", data: { assistantMessageID: "msg_1" } },
+      { type: "session.step.started", data: { assistantMessageID: "msg_2" } },
+      // duplicate step.ended for the same message: counted once
+      {
+        type: "session.step.ended",
+        data: { assistantMessageID: "msg_1", finish: "tool-calls", tokens: { input: 7, output: 3, reasoning: 1, cache: { read: 0, write: 0 } } },
+      },
+      {
+        type: "session.step.ended",
+        data: { assistantMessageID: "msg_1", finish: "tool-calls", tokens: { input: 7, output: 3, reasoning: 1, cache: { read: 0, write: 0 } } },
+      },
+    ],
+  });
+  setHolder(stub.url);
+  const adapter = makeV2Adapter();
+  try {
+    const result = await adapter.prompt({ ...PROMPT_INPUT });
+    const stats = result.turnStats;
+    assert.ok(stats);
+    assert.equal(stats.steps, 2);
+    assert.deepEqual(stats.finishReasons, ["tool-calls"]);
+    assert.deepEqual(stats.tokens, { input: 7, output: 3, reasoning: 1, cacheRead: 0, cacheWrite: 0 });
+  } finally {
+    await adapter.close().catch(() => undefined);
+    await stub.close();
+    clearHolder();
+  }
+});
+
+test("v2 turn stats: malformed events never break the prompt or the snapshot", async () => {
+  const stub = await startStub({
+    sseEvents: [
+      // object-shaped but empty/ill-typed: the wire protocol requires every
+      // data block to be an object, so malformed METADATA is what the
+      // collector must survive
+      {},
+      { type: null },
+      { type: 123 },
+      { type: "message.part.updated" },
+      { type: "message.part.updated", data: { part: "not-an-object" } },
+      { type: "message.part.updated", data: { part: { type: "tool" } } },
+      {
+        type: "message.part.updated",
+        data: { part: { type: "step-finish", reason: 42, tokens: { input: "lots", output: -5, cache: "nope" } } },
+      },
+      { type: "session.status", data: { status: { attempt: "three" } } },
+      { type: "session.status", data: { status: { attempt: 2 } } },
+    ],
+  });
+  setHolder(stub.url);
+  const adapter = makeV2Adapter();
+  try {
+    const result = await adapter.prompt({ ...PROMPT_INPUT });
+    assert.equal(result.text, "stub reply", "the prompt completes normally past malformed events");
+    const stats = result.turnStats;
+    assert.ok(stats);
+    assert.equal(stats.steps, 0);
+    assert.deepEqual(stats.toolCalls, { unknown: 1 }, "a tool part without a name is counted, not dropped silently");
+    assert.equal(stats.toolSpanMs, null, "a tool part without usable times measures nothing");
+    assert.equal(stats.tokens, null, "malformed token fields are never reported as usage");
+    assert.equal(stats.finishReasons, null);
+    assert.equal(stats.retries, 2, "a numeric retry attempt is honored, a string one ignored");
+    assert.equal(stats.outcome, "completed");
+  } finally {
+    await adapter.close().catch(() => undefined);
+    await stub.close();
+    clearHolder();
+  }
+});
+
+test("v2 prompt timeout: partial turn stats travel with the deadline error", async () => {
+  const stub = await startStub({
+    sseMode: "hold",
+    sseEvents: [
+      stepStartPart("prt_ss1"),
+      stepFinishPart("prt_sf1", "tool-calls", { input: 100, output: 50, reasoning: 20, cache: { read: 10, write: 5 } }),
+      toolPart("call_1", "read", { status: "completed", time: { start: 1_000, end: 1_100 } }),
+      { type: "session.status", data: { status: { attempt: 1 } } },
+    ],
+  });
+  setHolder(stub.url);
+  const adapter = makeV2Adapter("Qwen-Mimo/model.gguf", 300);
+  try {
+    const rejection = await adapter.prompt({ ...PROMPT_INPUT }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+    assert.ok(rejection instanceof Error, "the prompt must reject with the deadline error");
+    assert.match(
+      (rejection as Error).message,
+      /opencode prompt timed out after 300ms \(session ses_stub_001\)/,
+      "the original timeout diagnostic is unchanged",
+    );
+    const stats = turnStatsOf(rejection);
+    assert.ok(stats, "partial statistics are attached before the consumer state is lost");
+    assert.equal(stats.outcome, "timeout");
+    assert.equal(stats.terminalEvent, "deadline");
+    assert.equal(stats.steps, 1, "the step observed before the deadline");
+    assert.deepEqual(stats.tokens, { input: 100, output: 50, reasoning: 20, cacheRead: 10, cacheWrite: 5 });
+    assert.deepEqual(stats.toolCalls, { read: 1 });
+    assert.equal(stats.toolSpanMs, 100);
+    assert.deepEqual(stats.finishReasons, ["tool-calls"]);
+    assert.equal(stats.retries, 1);
+    assert.ok(stats.wallMs !== null && stats.wallMs >= 300, `the deadline is honored (wallMs=${stats.wallMs})`);
+    assert.ok(stats.firstStepAtMs !== null);
+  } finally {
+    await adapter.close().catch(() => undefined);
+    await stub.close();
+    clearHolder();
+  }
 });

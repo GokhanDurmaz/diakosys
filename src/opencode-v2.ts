@@ -7,7 +7,7 @@ import {
 } from "@opencode/client";
 import { spawnOpenCodeServer, basicAuthHeader, type ServerOptions } from "./opencode-server.ts";
 
-import type { OpenCodePromptResult } from "./opencode.ts";
+import type { OpenCodePromptResult, TurnStats } from "./opencode.ts";
 
 /**
  * OpenCode v2 backend (CLI ≥ v2.x, @opencode/client 2.x).
@@ -211,6 +211,264 @@ const TERMINAL_EVENT_TYPES: Array<string> = [
   "session.status",
 ];
 
+// ——— turn statistics (observability only; never affects prompt behavior) ———
+
+/** Defensive type guard for the `unknown` payloads arriving over the SSE wire. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** A usable non-negative finite number (timestamp or count). */
+function asCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** Mutable per-step token sums; `observed` stays false until a real numeric
+ *  field has been seen, so a missing measurement is never reported as zero. */
+interface TokenSums {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  observed: boolean;
+}
+
+function emptyTokenSums(): TokenSums {
+  return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, observed: false };
+}
+
+/** Add one step's token usage to the sums. Every field is validated
+ *  independently, so partial or malformed payloads still contribute exactly
+ *  what they genuinely carry. Returns true when at least one numeric field
+ *  was observed. */
+function accumulateTokens(raw: unknown, sums: TokenSums): boolean {
+  if (!isRecord(raw)) return false;
+  const cache = isRecord(raw.cache) ? raw.cache : {};
+  const fields: Array<["input" | "output" | "reasoning" | "cacheRead" | "cacheWrite", unknown]> = [
+    ["input", raw.input],
+    ["output", raw.output],
+    ["reasoning", raw.reasoning],
+    ["cacheRead", cache.read],
+    ["cacheWrite", cache.write],
+  ];
+  let any = false;
+  for (const [key, value] of fields) {
+    const n = asCount(value);
+    if (n !== undefined) {
+      sums[key] += n;
+      any = true;
+    }
+  }
+  return any;
+}
+
+/** Finalize the turn's statistics and attach the snapshot to the prompt's
+ *  result or rejection, so the caller can emit it on its own lifecycle
+ *  channel. Best effort: a snapshot failure is swallowed and the carrier
+ *  passes through unchanged — instrumentation never alters the outcome. */
+function attachTurnStats(
+  carrier: object,
+  stats: TurnStatsCollector,
+  outcome: TurnStats["outcome"],
+): void {
+  try {
+    (carrier as { turnStats?: TurnStats }).turnStats = stats.snapshot(outcome);
+  } catch {
+    // ignore: statistics are observational
+  }
+}
+
+interface TurnStatsCollector {
+  /** Record one SSE event. Never throws; malformed events are skipped. */
+  observe(event: unknown): void;
+  /** Build the immutable statistics snapshot for the turn's outcome. */
+  snapshot(outcome: TurnStats["outcome"]): TurnStats;
+}
+
+/**
+ * Accumulates turn statistics from the SSE events a prompt already receives.
+ *
+ * Everything is read defensively (unknown payloads, validated fields) and the
+ * whole event handling is isolated in its own try/catch: a malformed event
+ * must never break the prompt, the stream consumption, or the statistics.
+ *
+ * Canonical sources, to avoid double counting:
+ *   * steps / finish reasons / per-step tokens — the durable `step-start` /
+ *     `step-finish` PARTS on `message.part.updated`, deduped by part id (a
+ *     part is updated incrementally and may be observed repeatedly). The
+ *     dedicated `session.step.*` events are only a fallback when no part was
+ *     observed, and only one of the two sources is ever summed.
+ *   * aggregate usage events (`session.usage.*`, `message.updated`) are
+ *     never added on top of per-step data.
+ */
+function createTurnStatsCollector(sessionId: string): TurnStatsCollector {
+  const startedAt = Date.now();
+  let lastEventAt: number | undefined;
+  let firstStepAt: number | undefined;
+  let terminalType: string | undefined;
+  // steps: identifiable step-start parts win; unidentifiable parts and the
+  // dedicated `session.step.started` events are the fallback count.
+  const stepPartIds = new Set<string>();
+  let unidentifiableStepStarts = 0;
+  let stepStartedEvents = 0;
+  // per-step finishes: parts are canonical, `session.step.ended` the fallback.
+  const finishPartIds = new Set<string>();
+  let sawFinishPart = false;
+  const partFinishReasons: string[] = [];
+  const partTokens = emptyTokenSums();
+  const endedMessageIds = new Set<string>();
+  const endedFinishReasons: string[] = [];
+  const endedTokens = emptyTokenSums();
+  // tools: one entry per call identity (callID, else the part id, else the
+  // event itself); the first observed name wins.
+  const toolNameById = new Map<string, string>();
+  const toolSpanById = new Map<string, number>();
+  let unidentifiableTools = 0;
+  let retries = 0;
+
+  const noteStepStart = (id: unknown, now: number): void => {
+    if (typeof id === "string" && id.length > 0) stepPartIds.add(id);
+    else unidentifiableStepStarts += 1;
+    firstStepAt ??= now;
+  };
+
+  const noteToolPart = (part: Record<string, unknown>): void => {
+    const callId = typeof part.callID === "string" && part.callID.length > 0 ? part.callID : undefined;
+    const partId = typeof part.id === "string" && part.id.length > 0 ? part.id : undefined;
+    const identity = callId ?? (partId !== undefined ? `prt:${partId}` : `evt:${unidentifiableTools++}`);
+    if (!toolNameById.has(identity)) {
+      const name = typeof part.tool === "string" && part.tool.length > 0 ? part.tool : "unknown";
+      toolNameById.set(identity, name);
+    }
+    // duration: server-side start/end (with the message.list field names as
+    // a fallback); measured at most once per call, first measurement wins.
+    const state = isRecord(part.state) ? part.state : {};
+    const time = isRecord(state.time) ? state.time : {};
+    const start = asCount(time.start) ?? asCount(time.ran);
+    const end = asCount(time.end) ?? asCount(time.completed);
+    if (start !== undefined && end !== undefined && end >= start && !toolSpanById.has(identity)) {
+      toolSpanById.set(identity, end - start);
+    }
+  };
+
+  const notePart = (part: Record<string, unknown>, now: number): void => {
+    switch (part.type) {
+      case "step-start":
+        noteStepStart(part.id, now);
+        return;
+      case "step-finish": {
+        sawFinishPart = true;
+        const id = typeof part.id === "string" && part.id.length > 0 ? part.id : undefined;
+        // parts are updated incrementally: only the first sighting of a step
+        // finish contributes (a part without an id cannot be deduped)
+        if (id !== undefined && finishPartIds.has(id)) return;
+        if (id !== undefined) finishPartIds.add(id);
+        if (typeof part.reason === "string") partFinishReasons.push(part.reason);
+        if (accumulateTokens(part.tokens, partTokens)) partTokens.observed = true;
+        return;
+      }
+      case "tool":
+        noteToolPart(part);
+        return;
+      default:
+        // text/reasoning/… parts carry no statistics; their contents are
+        // never read
+        return;
+    }
+  };
+
+  return {
+    observe(rawEvent: unknown): void {
+      try {
+        if (!isRecord(rawEvent)) return;
+        const type = rawEvent.type;
+        if (typeof type !== "string") return;
+        const now = Date.now();
+        lastEventAt = now;
+        const data = isRecord(rawEvent.data) ? rawEvent.data : {};
+        if (type === "message.part.updated") {
+          const part = data.part;
+          if (isRecord(part)) notePart(part, now);
+        } else if (type === "session.step.started") {
+          stepStartedEvents += 1;
+          firstStepAt ??= now;
+        } else if (type === "session.step.ended") {
+          const messageId = typeof data.assistantMessageID === "string" ? data.assistantMessageID : undefined;
+          if (messageId !== undefined && endedMessageIds.has(messageId)) return;
+          if (messageId !== undefined) endedMessageIds.add(messageId);
+          if (typeof data.finish === "string") endedFinishReasons.push(data.finish);
+          if (accumulateTokens(data.tokens, endedTokens)) endedTokens.observed = true;
+        } else if (type === "session.status") {
+          const status = data.status;
+          if (isRecord(status)) {
+            const attempt = status.attempt;
+            if (typeof attempt === "number" && Number.isFinite(attempt) && attempt > retries) {
+              retries = attempt;
+            }
+          }
+        }
+        // Mirror the consumer's terminality so the snapshot can name the
+        // event that ended the turn (busy/retry statuses are not terminal).
+        const terminal =
+          type === "session.error" ||
+          type === "session.execution.failed" ||
+          (type === "session.status" && data.status === "idle") ||
+          (TERMINAL_EVENT_TYPES.includes(type) && type !== "session.status");
+        if (terminal) terminalType ??= type;
+      } catch {
+        // statistics are observational: a malformed event must never break
+        // the prompt or the stream
+      }
+    },
+
+    snapshot(outcome: TurnStats["outcome"]): TurnStats {
+      const now = Date.now();
+      const wallMs = Math.max(0, now - startedAt);
+      const steps =
+        stepPartIds.size > 0 ? stepPartIds.size : unidentifiableStepStarts + stepStartedEvents;
+      const toolCalls: Record<string, number> = {};
+      for (const name of toolNameById.values()) {
+        toolCalls[name] = (toolCalls[name] ?? 0) + 1;
+      }
+      let toolSpanMs: number | null = null;
+      if (toolSpanById.size > 0) {
+        toolSpanMs = 0;
+        for (const span of toolSpanById.values()) toolSpanMs += span;
+      }
+      // exactly one canonical token/finish-reason source: durable step-finish
+      // parts when any was observed, else the step.ended events
+      const usedParts = sawFinishPart;
+      const sums = usedParts ? partTokens : endedTokens;
+      const tokens: TurnStats["tokens"] = sums.observed
+        ? {
+            input: sums.input,
+            output: sums.output,
+            reasoning: sums.reasoning,
+            cacheRead: sums.cacheRead,
+            cacheWrite: sums.cacheWrite,
+          }
+        : null;
+      const reasons = usedParts ? partFinishReasons : endedFinishReasons;
+      return {
+        sessionId,
+        outcome,
+        terminalEvent: outcome === "timeout" ? "deadline" : (terminalType ?? null),
+        wallMs,
+        steps,
+        firstStepAtMs: firstStepAt === undefined ? null : Math.max(0, firstStepAt - startedAt),
+        lastEventAtMs: lastEventAt === undefined ? null : Math.max(0, lastEventAt - startedAt),
+        toolCalls,
+        toolSpanMs,
+        unattributedSpanMs: toolSpanMs === null ? null : Math.max(0, wallMs - toolSpanMs),
+        tokens,
+        finishReasons: reasons.length > 0 ? [...reasons] : null,
+        retries,
+      };
+    },
+  };
+}
+
 async function v2Prompt(client: ReturnType<typeof OpenCode.make>, input: V2PromptInput): Promise<OpenCodePromptResult> {
   const text = [
     `Task: ${input.title}`,
@@ -247,6 +505,12 @@ async function v2Prompt(client: ReturnType<typeof OpenCode.make>, input: V2Promp
   // underlying SSE fetch consumes.
   const events = client.event.subscribe({ signal: controller.signal });
 
+  // Turn statistics are collected from the events this prompt already
+  // receives — no extra request. The collector lives in THIS scope (not the
+  // consumer task's) so the deadline path can still snapshot the partial
+  // statistics after the consumer has been abandoned.
+  const stats = createTurnStatsCollector(input.sessionId);
+
   // The consumer runs as its own task so the deadline can abandon it: the
   // post-race `.catch` in the finally block keeps an abort-induced rejection
   // (e.g. the aborted SSE read surfacing as ClientError Transport) from
@@ -260,7 +524,13 @@ async function v2Prompt(client: ReturnType<typeof OpenCode.make>, input: V2Promp
     let terminalEvent: { type: string; data?: unknown } | undefined;
     let streamErrorMessage: string | undefined;
     for await (const rawEvent of events) {
+      // an SSE data block may be any JSON value; non-object blocks carry no
+      // event type and are skipped before anything reads into them
+      if (!isRecord(rawEvent)) continue;
       const event = rawEvent as { type: string; data?: unknown };
+      // statistics first, so the terminal event itself is recorded too;
+      // observe() is defensive and never throws
+      stats.observe(rawEvent);
       if (event.type === "session.error" || event.type === "session.execution.failed") {
         streamErrorMessage = JSON.stringify(event.data ?? {}).slice(0, 400);
         break;
@@ -311,13 +581,24 @@ async function v2Prompt(client: ReturnType<typeof OpenCode.make>, input: V2Promp
   })();
 
   try {
-    return await Promise.race([consume, timedOut]);
+    const result = await Promise.race([consume, timedOut]);
+    attachTurnStats(result, stats, "completed");
+    return result;
   } catch (error) {
     // The deadline error carries its own diagnostic; genuine SDK/stream
     // errors are wrapped so the HTTP reason/detail survive into the
-    // diagnostic (see toOpencodeError).
-    if (error === timeoutError) throw timeoutError;
-    throw toOpencodeError(error, input.sessionId);
+    // diagnostic (see toOpencodeError). Both rejections carry the turn's
+    // statistics snapshot (attached above by attachTurnStats).
+    if (error === timeoutError) {
+      // The deadline won: snapshot whatever partial statistics accumulated
+      // BEFORE the abandoned consumer's state is lost, and let them travel
+      // with the original timeout error so the caller can still emit them.
+      attachTurnStats(timeoutError, stats, "timeout");
+      throw timeoutError;
+    }
+    const wrapped = toOpencodeError(error, input.sessionId);
+    attachTurnStats(wrapped, stats, "error");
+    throw wrapped;
   } finally {
     clearTimeout(timer);
     // If the deadline won, consume is still unwinding; its abort-induced
