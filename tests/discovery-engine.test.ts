@@ -56,7 +56,6 @@ function engine(dir: string, options: Partial<DiscoveryOptions> = {}): { adapter
     repoDir: dir,
     model: MODEL,
     maxProposalsPerArea: 1,
-    promptTimeoutMs: 5000,
     // an engine must never persist into the real home cache dir
     cacheDir: fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-")),
     ...options,
@@ -96,7 +95,6 @@ test("engine writes only to an explicit cacheDir, never to the real home cache d
         repoDir,
         model: MODEL,
         maxProposalsPerArea: 1,
-        promptTimeoutMs: 5000,
         cacheDir,
         areas: ["reliability"],
       }).run();
@@ -135,7 +133,7 @@ test("collectEvidence reports per-area files and flags missing evidence files", 
     ]),
   );
   try {
-    const result = await new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 1, promptTimeoutMs: 5000, cacheDir, areas: ["reliability"] }).run();
+    const result = await new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 1, cacheDir, areas: ["reliability"] }).run();
     const report = collectEvidence(result, dir);
     assert.equal(report.areas.length, 1);
     assert.equal(report.areas[0]!.area, "reliability");
@@ -175,7 +173,6 @@ test("extraction below the per-area cap is not distorted by junk items", async (
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 1,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability"],
     }).run();
@@ -203,7 +200,6 @@ test("runArea reports a concise diagnostic when the reply contains no JSON at al
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 3,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability"],
       dryRun: true,
@@ -235,7 +231,6 @@ test("runArea names finish=tool-calls for an empty-text reply (the model ended o
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 3,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability"],
       dryRun: true,
@@ -263,7 +258,6 @@ test("a plausible truncated JSON reply surfaces a truncation diagnostic with the
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 3,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability"],
       dryRun: true,
@@ -292,7 +286,6 @@ test("truncation is still detected when balanced junk segments accompany the cut
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 3,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability"],
       dryRun: true,
@@ -319,7 +312,6 @@ test("ordinary prose with unmatched brackets keeps the no-JSON diagnostic, not t
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 3,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability"],
       dryRun: true,
@@ -345,7 +337,6 @@ test("a valid empty JSON array still reports ok with no rejections (not a no-JSO
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 3,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability"],
       dryRun: true,
@@ -370,7 +361,6 @@ test("onAreaStart reports each area with a 1-based index and the total", async (
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 3,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["architecture", "reliability"],
       dryRun: true,
@@ -478,7 +468,6 @@ test("reliability discovery prompt is targeted: scoped manifest, tighter cap, sm
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 3,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability", "architecture"],
     }).run();
@@ -574,7 +563,6 @@ test("reliability manifest cap (120) applies per area while other areas keep the
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 3,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability", "architecture"],
     }).run();
@@ -604,7 +592,7 @@ test("DiscoveryRunStore.persist writes the run result to a manifest the caller c
   const dbPath = path.join(cacheDir, "tasks.db");
   const settings = openDb(dbPath);
   const adapterForRun = new MockOpenCodeAdapter(() => JSON.stringify([proposal("Guard evaluator against NaN samples", 6, "low")]));
-  const engineForRun = new DiscoveryEngine(adapterForRun, { repoDir, model: MODEL, maxProposalsPerArea: 1, promptTimeoutMs: 5000, cacheDir, areas: ["reliability"] });
+  const engineForRun = new DiscoveryEngine(adapterForRun, { repoDir, model: MODEL, maxProposalsPerArea: 1, cacheDir, areas: ["reliability"] });
   try {
     const result = await engineForRun.run();
     assert.equal(result.persisted, true);
@@ -683,7 +671,6 @@ test("dry run does not persist the run manifest", async () => {
       model: MODEL,
       dryRun: true,
       maxProposalsPerArea: 1,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability"],
     });
@@ -945,7 +932,6 @@ test("title-similar proposals from different areas are deduped cross-area with f
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 1,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability", "performance"],
     });
@@ -969,8 +955,9 @@ test("title-similar proposals from different areas are deduped cross-area with f
 // next area's prompt is admitted. The stub records the prompt/abort sequence
 // in one journal so the ordering is directly assertable.
 
-/** Scripted outcomes per prompt call; "timeout" rejects with the real v2 deadline error. */
-type PromptOutcome = "timeout" | "reply";
+/** Scripted outcomes per prompt call; "no-terminal" rejects with the real v2
+ * no-terminal-event error. */
+type PromptOutcome = "no-terminal" | "reply";
 
 class OrphanTurnAdapter implements OpenCodeAdapter {
   readonly kind = "mock" as const;
@@ -981,7 +968,6 @@ class OrphanTurnAdapter implements OpenCodeAdapter {
     port: undefined,
     hostname: undefined,
     startupTimeoutMs: undefined,
-    promptTimeoutMs: undefined,
     workDirectory: undefined,
     endpoint: undefined,
   };
@@ -1012,9 +998,9 @@ class OrphanTurnAdapter implements OpenCodeAdapter {
     this.calls += 1;
     const index = this.calls;
     this.journal.push(`prompt:${index}`);
-    if ((this.outcomes[index - 1] ?? "reply") === "timeout") {
-      // the exact v2 deadline diagnostic shape (src/opencode-v2.ts)
-      throw new Error(`opencode prompt timed out after 420000ms (session ses_stub_001)`);
+    if ((this.outcomes[index - 1] ?? "reply") === "no-terminal") {
+      // the exact v2 no-terminal-event diagnostic shape (src/opencode-v2.ts)
+      throw new Error(`opencode prompt returned no terminal event (session ses_stub_001)`);
     }
     const text = JSON.stringify([proposal(`Orphan probe ${index}`, 6, "low")]);
     return {
@@ -1055,7 +1041,6 @@ function orphanEngine(adapter: OpenCodeAdapter, dir: string, cacheDir: string): 
     repoDir: dir,
     model: MODEL,
     maxProposalsPerArea: 1,
-    promptTimeoutMs: 5000,
     cacheDir,
     areas: ["architecture", "tests"],
   });
@@ -1064,12 +1049,12 @@ function orphanEngine(adapter: OpenCodeAdapter, dir: string, cacheDir: string): 
 test("a failed area prompt interrupts the shared session before the next area submits", async () => {
   const dir = tmpRepo();
   const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
-  const adapter = new OrphanTurnAdapter(["timeout", "reply"]);
+  const adapter = new OrphanTurnAdapter(["no-terminal", "reply"]);
   try {
     const result = await orphanEngine(adapter, dir, cacheDir).run();
     // the failed area keeps the original prompt error
     assert.equal(result.areas[0]?.status, "error");
-    assert.match(result.areas[0]?.error ?? "", /opencode prompt timed out after 420000ms \(session ses_stub_001\)/);
+    assert.match(result.areas[0]?.error ?? "", /opencode prompt returned no terminal event \(session ses_stub_001\)/);
     // the orphan turn was interrupted exactly once
     assert.deepEqual(adapter.aborted, ["ses_stub_001"]);
     // and the interrupt COMPLETED before the second area's prompt was admitted
@@ -1091,12 +1076,12 @@ test("a failed area prompt interrupts the shared session before the next area su
 test("a rejecting abort must not mask the original prompt error", async () => {
   const dir = tmpRepo();
   const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
-  const adapter = new OrphanTurnAdapter(["timeout", "reply"], "rejecting");
+  const adapter = new OrphanTurnAdapter(["no-terminal", "reply"], "rejecting");
   try {
     const result = await orphanEngine(adapter, dir, cacheDir).run();
     assert.equal(result.areas[0]?.status, "error");
     // the reported error is the prompt's, not the abort's
-    assert.match(result.areas[0]?.error ?? "", /opencode prompt timed out after 420000ms \(session ses_stub_001\)/);
+    assert.match(result.areas[0]?.error ?? "", /opencode prompt returned no terminal event \(session ses_stub_001\)/);
     assert.ok(!(result.areas[0]?.error ?? "").includes("interrupt POST failed"), "the abort failure must stay swallowed");
     // the abort was still requested, and the next area still ran
     assert.deepEqual(adapter.aborted, ["ses_stub_001"]);
@@ -1110,7 +1095,7 @@ test("a rejecting abort must not mask the original prompt error", async () => {
 test("a never-settling abort cannot stall discovery past the grace period", async () => {
   const dir = tmpRepo();
   const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
-  const adapter = new OrphanTurnAdapter(["timeout", "reply"], "hanging");
+  const adapter = new OrphanTurnAdapter(["no-terminal", "reply"], "hanging");
   try {
     const started = Date.now();
     const result = await orphanEngine(adapter, dir, cacheDir).run();
@@ -1156,7 +1141,6 @@ test("a symlinked directory in the repo never aborts the run: both areas still c
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 1,
-      promptTimeoutMs: 5000,
       cacheDir,
       dryRun: true,
       areas: ["architecture", "tests"],
@@ -1215,7 +1199,6 @@ class StatsCarrierAdapter implements OpenCodeAdapter {
     port: undefined,
     hostname: undefined,
     startupTimeoutMs: undefined,
-    promptTimeoutMs: undefined,
     workDirectory: undefined,
     endpoint: undefined,
   };
@@ -1246,7 +1229,7 @@ class StatsCarrierAdapter implements OpenCodeAdapter {
     if ((this.outcomes[this.calls - 1] ?? "ok") === "fail") {
       // the exact v2 deadline diagnostic shape, carrying the partial snapshot
       throw Object.assign(
-        new Error("opencode prompt timed out after 420000ms (session ses_stub_001)"),
+        new Error("opencode prompt returned no terminal event (session ses_stub_001)"),
         this.failStats === undefined ? {} : { turnStats: this.failStats },
       );
     }
@@ -1284,7 +1267,6 @@ function statsEngine(
     repoDir: dir,
     model: MODEL,
     maxProposalsPerArea: 1,
-    promptTimeoutMs: 5_000,
     cacheDir,
     areas: ["architecture", "tests"],
     onLifecycle: (event) => events.push(event),
@@ -1332,19 +1314,19 @@ test("a failed prompt emits one turn-stats event and keeps the original error ve
   const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
   const events: LifecycleEvent[] = [];
   const adapter = new StatsCarrierAdapter(["fail", "ok"], {
-    fail: turnStatsFixture({ outcome: "timeout", terminalEvent: "deadline", steps: 4, toolCalls: { read: 3 }, tokens: null, finishReasons: null }),
+    fail: turnStatsFixture({ outcome: "error", terminalEvent: null, steps: 4, toolCalls: { read: 3 }, tokens: null, finishReasons: null }),
     ok: turnStatsFixture(),
   });
   try {
     const result = await statsEngine(adapter, dir, cacheDir, events).run();
     assert.equal(result.areas[0]?.status, "error");
-    assert.match(result.areas[0]?.error ?? "", /opencode prompt timed out after 420000ms \(session ses_stub_001\)/);
+    assert.match(result.areas[0]?.error ?? "", /opencode prompt returned no terminal event \(session ses_stub_001\)/);
     const statsEvents = events.filter((e) => e.event === "turn-stats");
     assert.equal(statsEvents.length, 2, "the failed prompt emitted its own single event");
     const failed = statsEvents[0] as unknown as Record<string, unknown>;
     assert.equal(failed.areaId, "architecture");
-    assert.equal(failed.outcome, "timeout");
-    assert.equal(failed.terminalEvent, "deadline");
+    assert.equal(failed.outcome, "error");
+    assert.equal(failed.terminalEvent, undefined, "a prompt with no terminal event omits the field");
     assert.equal(failed.steps, 4);
     assert.equal(failed.toolCalls, "read:3");
     assert.ok(!("tokensInput" in failed) || failed.tokensInput === undefined, "missing token data is omitted, not zero");
@@ -1352,7 +1334,7 @@ test("a failed prompt emits one turn-stats event and keeps the original error ve
     // the existing ERROR verdict still fires alongside the stats event
     const errorEvent = events.find((e) => e.event === "error" && e.level === "ERROR");
     assert.ok(errorEvent !== undefined, "the pre-existing error lifecycle event is unchanged");
-    assert.match(errorEvent.error ?? "", /opencode prompt timed out after 420000ms/);
+    assert.match(errorEvent.error ?? "", /opencode prompt returned no terminal event/);
     // the second area's prompt emitted its own completed event
     assert.equal(statsEvents[1] && (statsEvents[1] as unknown as Record<string, unknown>).outcome, "completed");
   } finally {
@@ -1381,14 +1363,13 @@ test("a throwing lifecycle observer cannot mask the original prompt error", asyn
   const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
   const events: LifecycleEvent[] = [];
   const adapter = new StatsCarrierAdapter(["fail", "ok"], {
-    fail: turnStatsFixture({ outcome: "timeout", terminalEvent: "deadline" }),
+    fail: turnStatsFixture({ outcome: "error", terminalEvent: null }),
     ok: turnStatsFixture(),
   });
   const engine = new DiscoveryEngine(adapter, {
     repoDir: dir,
     model: MODEL,
     maxProposalsPerArea: 1,
-    promptTimeoutMs: 5_000,
     cacheDir,
     areas: ["architecture", "tests"],
     onLifecycle: (event) => {
@@ -1399,7 +1380,7 @@ test("a throwing lifecycle observer cannot mask the original prompt error", asyn
   try {
     const result = await engine.run();
     assert.equal(result.areas[0]?.status, "error");
-    assert.match(result.areas[0]?.error ?? "", /opencode prompt timed out after 420000ms/, "the original error message survives the instrumentation failure");
+    assert.match(result.areas[0]?.error ?? "", /opencode prompt returned no terminal event/, "the original error message survives the instrumentation failure");
     assert.equal(result.areas[1]?.status, "ok", "the observer failure stays swallowed and discovery continues");
     assert.equal(events.filter((e) => e.event === "turn-stats").length, 0, "the failed emissions never surface");
   } finally {
@@ -1423,7 +1404,6 @@ test("a complete proposal with an empty dependencies array is accepted end-to-en
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 1,
-      promptTimeoutMs: 5_000,
       cacheDir,
       areas: ["tests"],
     });

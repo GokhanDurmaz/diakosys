@@ -41,8 +41,6 @@ export interface CycleOptions {
     areas?: string[];
     /** max accepted proposals per area (discovery engine requires it) */
     maxProposalsPerArea: number;
-    /** read-only analysis prompt timeout (DiscoveryOptions requires it) */
-    promptTimeoutMs: number;
     /** Isolated cacheDir for the engine's runs.json manifest — tests MUST
      * pass a temp dir so the real $HOME cache is never written. */
     cacheDir?: string;
@@ -231,7 +229,6 @@ export async function runCycle(options: CycleOptions): Promise<CycleSummary> {
         const engine = new DiscoveryEngine(d.adapter, {
           repoDir: d.repoDir,
           model: d.model,
-          promptTimeoutMs: d.promptTimeoutMs,
           maxProposalsPerArea: d.maxProposalsPerArea,
           ...(d.areas !== undefined ? { areas: selectAreas(d.areas).map((a) => a.key) } : {}),
           ...(d.cacheDir !== undefined ? { cacheDir: d.cacheDir } : {}),

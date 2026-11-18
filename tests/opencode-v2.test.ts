@@ -77,8 +77,11 @@ interface StubOptions {
   sseContentType?: string;
   /** SSE behavior for GET /api/event: "idle" (default) sends a terminal
    * session.status event then ends; "hold" flushes the headers and never
-   * sends a body byte — a prompt then never sees a terminal event. */
-  sseMode?: "idle" | "hold";
+   * sends a body byte — a prompt then never sees a terminal event;
+   * "no-terminal" sends the scripted events and ends the stream without a
+   * terminal event — the prompt must wait and then fail with the
+   * no-terminal-event diagnostic (there is no client deadline). */
+  sseMode?: "idle" | "hold" | "no-terminal";
   /** POST /prompt is accepted (fully read) but never answered — the client's
    * fetch stays pending, so the prompt acknowledgement never resolves. */
   promptHang?: boolean;
@@ -201,17 +204,22 @@ async function startStub(options: StubOptions = {}): Promise<StubHandle> {
         res.on("close", () => {
           sseCounters.closed += 1;
         });
-        if (options.sseMode === "hold") {
+        if (options.sseMode === "hold" || options.sseMode === "no-terminal") {
           // Headers only: flush them now and hold the stream open forever —
           // no terminal event is ever sent, so a subscriber never completes.
           // Scripted events (when present) are still delivered first, so a
-          // prompt can observe partial activity before its deadline.
+          // prompt can observe partial activity.
           // (writeHead alone never reaches the wire; the probe verified
           // that flushHeaders() is required for the client to see the stream.)
           res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
           res.flushHeaders();
           for (const event of options.sseEvents ?? []) {
             res.write(`data: ${JSON.stringify(event)}\n\n`);
+          }
+          if (options.sseMode === "no-terminal") {
+            // End the stream now — the subscriber completes with no terminal
+            // event, so the prompt must reject rather than hang.
+            res.end();
           }
           return;
         }
@@ -272,12 +280,11 @@ async function startStub(options: StubOptions = {}): Promise<StubHandle> {
 
 // ——— adapter + assertion helpers ———
 
-function makeV2Adapter(model = "Qwen-Mimo/model.gguf", promptTimeoutMs = 5_000): LiveOpenCodeAdapter {
+function makeV2Adapter(model = "Qwen-Mimo/model.gguf"): LiveOpenCodeAdapter {
   return new LiveOpenCodeAdapter({
     projectDirectory: PROJECT_DIR,
     model,
     startupTimeoutMs: 2_000,
-    promptTimeoutMs,
   });
 }
 
@@ -507,62 +514,49 @@ test("v2 diagnostics: an UnsupportedContentType SSE failure keeps reason and con
   }
 });
 
-// ——— prompt timeout regression tests ———
-// The v2 deadline must bound the WHOLE prompt operation: the prompt POST, the
-// wait for a terminal SSE event, and the assistant-message read. Both tests
-// use a short (300ms) deadline and assert a bounded, descriptive rejection.
+// ——— no-deadline regression tests ———
+// The v2 adapter used to abort the whole prompt operation (prompt POST +
+// terminal-event wait + assistant-message read) on a fixed 420s client
+// deadline. That deadline is gone: the prompt now waits for a genuine
+// terminal event and only fails when the stream ends without one. These
+// tests assert the no-terminal-event diagnostic and the bounded cleanup.
 
-test("v2 prompt timeout: prompt accepted but no terminal SSE event arrives", async () => {
-  const stub = await startStub({ sseMode: "hold" });
+test("v2 prompt waits for a terminal event instead of aborting at a deadline", async () => {
+  const stub = await startStub({
+    sseMode: "no-terminal",
+    sseEvents: [
+      { type: "session.step.started", data: { assistantMessageID: "msg_1" } },
+      {
+        type: "session.step.ended",
+        data: { assistantMessageID: "msg_1", finish: "tool-calls", tokens: { input: 7, output: 3, reasoning: 1, cache: { read: 0, write: 0 } } },
+      },
+    ],
+  });
   setHolder(stub.url);
-  const adapter = makeV2Adapter("Qwen-Mimo/model.gguf", 300);
+  const adapter = makeV2Adapter();
   try {
-    const started = Date.now();
-    await assert.rejects(
-      adapter.prompt({ ...PROMPT_INPUT }),
-      /opencode prompt timed out after 300ms \(session ses_stub_001\)/,
-      "the timeout diagnostic must name the deadline and the session",
+    const rejection = await adapter.prompt({ ...PROMPT_INPUT }).then(
+      () => null,
+      (err: unknown) => err,
     );
-    const elapsed = Date.now() - started;
-    assert.ok(elapsed >= 250, `the deadline must be honored, rejected after ${elapsed}ms`);
-    assert.ok(elapsed < 4_000, `the rejection must be bounded, took ${elapsed}ms`);
+    assert.ok(rejection instanceof Error, "the prompt must reject when the stream ends with no terminal event");
+    assert.match(
+      (rejection as Error).message,
+      /opencode prompt returned no terminal event \(session ses_stub_001\)/,
+      "the no-terminal-event diagnostic must name the session",
+    );
+    // The partial activity observed before the stream ended is recorded.
+    const stats = turnStatsOf(rejection);
+    assert.ok(stats, "partial statistics are attached before the consumer state is lost");
+    assert.equal(stats.outcome, "error");
+    assert.equal(stats.steps, 1, "the step observed before the stream ended");
+    assert.deepEqual(stats.tokens, { input: 7, output: 3, reasoning: 1, cacheRead: 0, cacheWrite: 0 });
+    assert.deepEqual(stats.finishReasons, ["tool-calls"]);
 
-    // The prompt was accepted and the SSE stream subscribed before the deadline.
-    assert.ok(findPrompt(stub), "the prompt POST must have been sent");
-    assert.equal(stub.sseOpened, 1, "the SSE stream must have been subscribed");
-
-    // After the deadline the aborted stream consumer must release the
-    // connection — no indefinitely running SSE subscriber.
+    // The abandoned SSE subscriber must release its connection — no
+    // indefinitely running stream.
     const closed = await waitUntil(() => stub.sseClosed >= 1, 2_000);
-    assert.ok(closed, `the abandoned SSE connection must close after the deadline (opened=${stub.sseOpened}, closed=${stub.sseClosed})`);
-  } finally {
-    await adapter.close().catch(() => undefined);
-    await stub.close();
-    clearHolder();
-  }
-});
-
-test("v2 prompt timeout: the prompt request itself never resolves", async () => {
-  const stub = await startStub({ promptHang: true });
-  setHolder(stub.url);
-  const adapter = makeV2Adapter("Qwen-Mimo/model.gguf", 300);
-  try {
-    const started = Date.now();
-    await assert.rejects(
-      adapter.prompt({ ...PROMPT_INPUT }),
-      /opencode prompt timed out after 300ms \(session ses_stub_001\)/,
-      "a hanging prompt POST must also hit the deadline diagnostic",
-    );
-    const elapsed = Date.now() - started;
-    assert.ok(elapsed >= 250, `the deadline must be honored, rejected after ${elapsed}ms`);
-    assert.ok(elapsed < 4_000, `the rejection must be bounded, took ${elapsed}ms`);
-
-    // The prompt request was sent and accepted, just never answered. The SSE
-    // subscription is lazy — its connection opens only when the consumer
-    // starts iterating, which never happens while the prompt hangs — so the
-    // stub observes zero SSE connections and none are leaked.
-    assert.ok(findPrompt(stub), "the prompt POST must have been sent");
-    assert.equal(stub.sseOpened, 0, "the lazy SSE stream never connects while the prompt hangs");
+    assert.ok(closed, `the abandoned SSE connection must close (opened=${stub.sseOpened}, closed=${stub.sseClosed})`);
   } finally {
     await adapter.close().catch(() => undefined);
     await stub.close();
@@ -868,32 +862,31 @@ test("v2 prompt timeout: partial turn stats travel with the deadline error", asy
       stepFinishPart("prt_sf1", "tool-calls", { input: 100, output: 50, reasoning: 20, cache: { read: 10, write: 5 } }),
       toolPart("call_1", "read", { status: "completed", time: { start: 1_000, end: 1_100 } }),
       { type: "session.status", data: { status: { attempt: 1 } } },
+      { type: "session.error", data: { code: "session_error", message: "server-side failure" } },
     ],
   });
   setHolder(stub.url);
-  const adapter = makeV2Adapter("Qwen-Mimo/model.gguf", 300);
+  const adapter = makeV2Adapter("Qwen-Mimo/model.gguf");
   try {
     const rejection = await adapter.prompt({ ...PROMPT_INPUT }).then(
       () => null,
       (err: unknown) => err,
     );
-    assert.ok(rejection instanceof Error, "the prompt must reject with the deadline error");
+    assert.ok(rejection instanceof Error, "a stream error must reject the prompt");
     assert.match(
       (rejection as Error).message,
-      /opencode prompt timed out after 300ms \(session ses_stub_001\)/,
-      "the original timeout diagnostic is unchanged",
+      /opencode prompt ended with a session error \(session ses_stub_001\)/,
+      "the stream error must be propagated with its reason",
     );
     const stats = turnStatsOf(rejection);
     assert.ok(stats, "partial statistics are attached before the consumer state is lost");
-    assert.equal(stats.outcome, "timeout");
-    assert.equal(stats.terminalEvent, "deadline");
-    assert.equal(stats.steps, 1, "the step observed before the deadline");
+    assert.equal(stats.outcome, "error");
+    assert.equal(stats.steps, 1, "the step observed before the stream error");
     assert.deepEqual(stats.tokens, { input: 100, output: 50, reasoning: 20, cacheRead: 10, cacheWrite: 5 });
     assert.deepEqual(stats.toolCalls, { read: 1 });
     assert.equal(stats.toolSpanMs, 100);
     assert.deepEqual(stats.finishReasons, ["tool-calls"]);
     assert.equal(stats.retries, 1);
-    assert.ok(stats.wallMs !== null && stats.wallMs >= 300, `the deadline is honored (wallMs=${stats.wallMs})`);
     assert.ok(stats.firstStepAtMs !== null);
   } finally {
     await adapter.close().catch(() => undefined);

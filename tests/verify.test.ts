@@ -42,7 +42,6 @@ class ToolPartAdapter implements OpenCodeAdapter {
     port: undefined,
     hostname: undefined,
     startupTimeoutMs: undefined,
-    promptTimeoutMs: undefined,
     workDirectory: undefined,
     endpoint: undefined,
   };
@@ -200,7 +199,6 @@ class DelayedAdapter implements OpenCodeAdapter {
     port: undefined,
     hostname: undefined,
     startupTimeoutMs: undefined,
-    promptTimeoutMs: undefined,
     workDirectory: undefined,
     endpoint: undefined,
   };

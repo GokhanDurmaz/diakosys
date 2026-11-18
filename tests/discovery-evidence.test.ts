@@ -165,7 +165,6 @@ test("the engine progresses past evidence selection: the prompt manifest lists r
       repoDir: dir,
       model: MODEL,
       maxProposalsPerArea: 1,
-      promptTimeoutMs: 5000,
       cacheDir,
       areas: ["reliability", "architecture"],
       dryRun: true,

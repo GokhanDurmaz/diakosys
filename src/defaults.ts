@@ -20,12 +20,6 @@ export const DEFAULT_PORT = 4096;
 /** Default OpenCode server startup timeout (ms). */
 export const DEFAULT_STARTUP_TIMEOUT_MS = 20_000;
 
-/** Default prompt timeout (ms). */
-export const DEFAULT_PROMPT_TIMEOUT_MS = 600_000;
-
-/** Default discovery prompt timeout (ms). */
-export const DEFAULT_DISCOVERY_TIMEOUT_MS = 420_000;
-
 /** Default max validated proposals per discovery area. */
 export const DEFAULT_DISCOVERY_MAX_PROPOSALS = 3;
 

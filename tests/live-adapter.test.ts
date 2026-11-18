@@ -185,7 +185,8 @@ async function startStub(options: StubOptions): Promise<StubHandle> {
           return;
         }
         // end-without-idle: hold the stream open, then end it without ever
-        // emitting session.idle — the adapter must fail on its own timeout
+        // emitting session.idle — the adapter must reject with a
+        // no-terminal-event error instead of timing out
         sseTimers.push(setTimeout(() => res.end(), options.sseEndAfterMs ?? 300));
         return;
       }
@@ -281,7 +282,6 @@ function makeAdapter(overrides: Partial<ConstructorParameters<typeof LiveOpenCod
     projectDirectory: "/tmp/diakosys-stub-project",
     model: "Qwen-Mimo/model.gguf",
     startupTimeoutMs: 2_000,
-    promptTimeoutMs: 5_000,
     ...overrides,
   });
 }
@@ -463,14 +463,20 @@ test("prompt: a session.error SSE event fails the prompt and no messages are rea
   }
 });
 
-test("prompt: an SSE stream that never goes idle fails on the configured prompt timeout", async () => {
-  const stub = await startStub({ sseMode: "end-without-idle", sseEndAfterMs: 400 });
+test("prompt: an SSE stream that ends without session.idle fails with a no-terminal-event error", async () => {
+  const stub = await startStub({ sseMode: "end-without-idle", sseEndAfterMs: 300 });
   setHolder(stub.url);
-  const adapter = makeAdapter({ promptTimeoutMs: 120 });
+  const adapter = makeAdapter();
   try {
-    await assert.rejects(
-      withDeadline(adapter.prompt({ ...PROMPT_INPUT }), "timeout prompt"),
-      /opencode prompt timed out after 120ms/,
+    const rejection = await adapter.prompt({ ...PROMPT_INPUT }).then(
+      () => null,
+      (err: unknown) => err,
+    );
+    assert.ok(rejection instanceof Error, "the prompt must reject when the stream ends without session.idle");
+    assert.match(
+      (rejection as Error).message,
+      /opencode prompt returned no terminal event \(session ses_stub_001\)/,
+      "the diagnostic names the terminal-event failure and the session",
     );
     assert.equal(messageReads(stub).length, 0, "no messages are read when the stream never goes idle");
   } finally {
@@ -617,7 +623,6 @@ test(
         model: "Qwen-Mimo/model.gguf",
         endpoint: `${stub.url}/v1`,
         startupTimeoutMs: 2_000,
-        promptTimeoutMs: 5_000,
       });
       await adapter.probe();
       // the endpoint-derived config reaches createOpencodeServer
@@ -710,7 +715,6 @@ test(
         model: "Qwen-Mimo/model.gguf",
         endpoint: `${stub.url}/v1`,
         startupTimeoutMs: 2_000,
-        promptTimeoutMs: 5_000,
         configOverrides: { permission: { "*": "deny" }, lsp: false },
       });
       await adapter.probe();

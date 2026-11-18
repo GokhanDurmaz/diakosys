@@ -66,9 +66,9 @@ export interface VerifyOptions {
 /**
  * Verify one task that is in VERIFYING state. The outcome is explicit:
  * PASS → DONE, FAIL → FAILED, skipped → no state change. A verifier throw
- * (including the adapter's prompt timeout) is a verification FAILURE, never
- * a silent pass. The verification timeout is the adapter's own
- * promptTimeoutMs (opencode.ts DEFAULT_PROMPT_MS / configured by the caller).
+ * (including the adapter's prompt returning no terminal event) is a
+ * verification FAILURE, never a silent pass. The verification timeout is the
+ * adapter's own; DEFAULT_STARTUP_MS applies to server startup only.
  *
  * With a lease authority the terminal write is atomic: verification
  * metadata, the DONE/FAILED transition and lease clearance (exec_gen bump)

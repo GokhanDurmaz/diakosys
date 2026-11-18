@@ -200,7 +200,6 @@ export interface DiscoveryOptions {
   /** directory holding the resumable discovery-run manifest */
   cacheDir?: string;
   maxProposalsPerArea: number;
-  promptTimeoutMs: number;
   manifestLimit?: number;
   /**
    * Explicit per-area prompt/context budget (chars), defaulting to
@@ -223,7 +222,7 @@ export interface DiscoveryOptions {
    * Per-area progress callback, invoked (synchronously, in area order) right
    * before each area's model prompt starts. The CLI uses it to report that
    * work is happening — without it a slow model run looks like a frozen
-   * process for the entire prompt timeout.
+   * process for the whole prompt operation.
    */
   onAreaStart?: (area: string, index: number, total: number) => void;
   /**

@@ -124,8 +124,7 @@ Machine-specific settings live in `~/.config/diakosys/config.json` (`endpoint`, 
 | `DIAKOSYS_ORCHESTRATOR_AGENT` | Agent used for execution sessions |
 | `DIAKOSYS_ORCHESTRATOR_PROJECT_DIR` | Repository the orchestrator works on. Default: current working directory |
 | `DIAKOSYS_ORCHESTRATOR_PORT` | Port the spawned OpenCode server binds to. Default: `4096` |
-| `DIAKOSYS_ORCHESTRATOR_PROMPT_TIMEOUT_MS` | Per-prompt timeout. Default: `600000` (10 min) |
-| `DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS` / `DIAKOSYS_ORCHESTRATOR_LOCK_TTL_MS` | Task-lease and coordinator-lock TTLs (derive from the prompt timeout when unset) |
+| `DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS` / `DIAKOSYS_ORCHESTRATOR_LOCK_TTL_MS` | Task-lease and coordinator-lock TTLs (standalone constants, overridable here) |
 | `DIAKOSYS_ORCHESTRATOR_RETRY_MAX_ATTEMPTS` / `_BASE_MS` / `_MAX_MS` | Retry policy: attempt cap, base backoff, backoff cap |
 | `DIAKOSYS_ORCHESTRATOR_RECOVER_ON_START` | Boolean (default `true`); when `false`, `cycle` skips its startup recovery pass |
 | `DIAKOSYS_ENDPOINT` | Highest-precedence model endpoint override |

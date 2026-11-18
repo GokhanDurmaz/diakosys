@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resolveConfig, readUserConfig, resolveEndpoint, DEFAULT_PROVIDER, DEFAULT_MODEL_ID, DEFAULT_ENDPOINT } from "../src/config.ts";
+import { resolveConfig, readUserConfig, resolveEndpoint, DEFAULT_PROVIDER, DEFAULT_MODEL_ID, DEFAULT_ENDPOINT, DEFAULT_TASK_LEASE_TTL_MS } from "../src/config.ts";
 
 function withUserConfig(content: string, fn: () => void): void {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-home-"));
@@ -70,7 +70,7 @@ test("defaults resolve to the MiMo configuration", () => {
       assert.equal(c.endpoint, DEFAULT_ENDPOINT);
       assert.equal(c.projectDirectory, "/repo");
       assert.equal(c.port, 4096);
-      assert.equal(c.promptTimeoutMs, 600_000);
+      assert.equal(c.taskLeaseTtlMs, DEFAULT_TASK_LEASE_TTL_MS);
       assert.equal(c.agent, undefined);
     },
   );
@@ -117,7 +117,9 @@ test("numeric env overrides are parsed and validated", () => {
     () => {
       const c = resolveConfig();
       assert.equal(c.port, 4099);
-      assert.equal(c.promptTimeoutMs, 900_000);
+      // no per-prompt deadline remains: the env var is inert and the lease
+      // keeps its standalone default, regardless of the dropped value
+      assert.equal(c.taskLeaseTtlMs, DEFAULT_TASK_LEASE_TTL_MS);
     },
   );
   withEnv({ DIAKOSYS_ORCHESTRATOR_PORT: "zero" }, () => {
@@ -259,23 +261,15 @@ test("config file endpoint and provider settings are preserved when injecting", 
   );
 });
 
-test("lease and lock TTLs derive from the prompt timeouts and env overrides", () => {
+test("the task lease is a standalone constant and the lock is derived from it", () => {
+  // With no per-prompt deadline left, the lease no longer derives from prompt
+  // or discovery timeouts; it is a standalone constant (overridable via
+  // DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS) and the lock is sized from it.
   withEnv({}, () => {
     const c = resolveConfig();
-    assert.equal(c.taskLeaseTtlMs, 2 * Math.max(600_000, 420_000));
-    assert.equal(c.lockTtlMs, Math.max(120_000, 2 * c.taskLeaseTtlMs));
+    assert.equal(c.taskLeaseTtlMs, 1_200_000);
+    assert.equal(c.lockTtlMs, 2_400_000); // 2 × the lease
   });
-  withEnv(
-    {
-      DIAKOSYS_ORCHESTRATOR_PROMPT_TIMEOUT_MS: "20000",
-      DIAKOSYS_ORCHESTRATOR_DISCOVERY_TIMEOUT_MS: "10000",
-    },
-    () => {
-      const c = resolveConfig();
-      assert.equal(c.taskLeaseTtlMs, 40_000); // 2 × max(prompt, discovery)
-      assert.equal(c.lockTtlMs, 120_000); // the 120s floor applies
-    },
-  );
   withEnv(
     {
       DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS: "5000",

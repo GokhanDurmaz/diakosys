@@ -48,7 +48,6 @@ export interface V1PromptInput {
   model: { providerID: string; modelID: string };
   agent?: string;
   tools?: Record<string, boolean>;
-  promptTimeoutMs: number;
 }
 
 export interface V1ServerOptions extends ServerOptions {
@@ -153,11 +152,10 @@ async function v1Prompt(client: OpencodeClient, input: V1PromptInput): Promise<O
     .filter(Boolean)
     .join("\n");
 
-  // Subscribe BEFORE firing the prompt so no early events are lost.
+  // Subscribe BEFORE firing the prompt so no early events are lost. There is
+  // no client-side deadline: the prompt runs until the server reports the
+  // session idle or an error, or the caller cancels it.
   const events = await client.event.subscribe({});
-  const timer = setTimeout(() => {
-    void events.stream.return(undefined as never).catch(() => undefined);
-  }, input.promptTimeoutMs);
   let idle = false;
   let streamErrorMessage: string | undefined;
   try {
@@ -189,11 +187,17 @@ async function v1Prompt(client: OpencodeClient, input: V1PromptInput): Promise<O
       }
     }
   } finally {
-    clearTimeout(timer);
-    void events.stream.return(undefined as never).catch(() => undefined);
+    // The SSE result exposes an AsyncGenerator, which does have return() —
+    // dispose it on every exit path so a prompt that never reaches "idle"
+    // does not leave the stream open.
+    void events.stream.return(undefined).catch(() => undefined);
   }
   if (!idle) {
-    throw new Error(streamErrorMessage ?? `opencode prompt timed out after ${input.promptTimeoutMs}ms (session ${input.sessionId})`);
+    throw new Error(
+      streamErrorMessage !== undefined
+        ? `opencode prompt ended with a session error (session ${input.sessionId}): ${streamErrorMessage}`
+        : `opencode prompt returned no terminal event (session ${input.sessionId})`,
+    );
   }
 
   let lastMessagesError: unknown;

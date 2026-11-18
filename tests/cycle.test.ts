@@ -249,7 +249,6 @@ test("mock discovery runs through the engine and the cycle completes it", async 
           model: "test/discovery",
           areas: ["reliability"],
           maxProposalsPerArea: 1,
-          promptTimeoutMs: 5000,
           cacheDir,
         },
         executionAdapter: mockCycleAdapter("PASS"),

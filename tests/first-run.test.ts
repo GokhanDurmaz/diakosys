@@ -1171,7 +1171,6 @@ test("v1: the configured agent reaches prompt_async when the caller passes none"
     model: "Qwen-Mimo/model.gguf",
     agent: "plan",
     startupTimeoutMs: 2_000,
-    promptTimeoutMs: 5_000,
   });
   try {
     const result = await adapter.prompt({
@@ -1199,7 +1198,6 @@ test("v1: without a configured agent the prompt body carries no agent field (ser
     projectDirectory: PROJECT_DIR,
     model: "Qwen-Mimo/model.gguf",
     startupTimeoutMs: 2_000,
-    promptTimeoutMs: 5_000,
   });
   try {
     await adapter.prompt({
@@ -1226,7 +1224,6 @@ test("v1: an explicit per-call agent wins over the configured one", async () => 
     model: "Qwen-Mimo/model.gguf",
     agent: "plan",
     startupTimeoutMs: 2_000,
-    promptTimeoutMs: 5_000,
   });
   try {
     await adapter.prompt({

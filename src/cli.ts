@@ -220,7 +220,7 @@ function usage(code: number): void {
       "                              (add --mock-fail to make verification fail deterministically)",
       "  tasks [--state <s>]         Tasks with priority, status and dependencies",
       "",
-      `Environment: ${DB_ENV}, DIAKOSYS_ORCHESTRATOR_MODEL / DIAKOSYS_ORCHESTRATOR_PROVIDER + DIAKOSYS_ORCHESTRATOR_MODEL_ID, DIAKOSYS_ORCHESTRATOR_AGENT, DIAKOSYS_ORCHESTRATOR_PROJECT_DIR, DIAKOSYS_ORCHESTRATOR_PORT, DIAKOSYS_ORCHESTRATOR_PROMPT_TIMEOUT_MS, DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS, DIAKOSYS_ORCHESTRATOR_LOCK_TTL_MS, DIAKOSYS_ORCHESTRATOR_RETRY_MAX_ATTEMPTS / _BASE_MS / _MAX_MS, DIAKOSYS_ORCHESTRATOR_RECOVER_ON_START`,
+      `Environment: ${DB_ENV}, DIAKOSYS_ORCHESTRATOR_MODEL / DIAKOSYS_ORCHESTRATOR_PROVIDER + DIAKOSYS_ORCHESTRATOR_MODEL_ID, DIAKOSYS_ORCHESTRATOR_AGENT, DIAKOSYS_ORCHESTRATOR_PROJECT_DIR, DIAKOSYS_ORCHESTRATOR_PORT, DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS, DIAKOSYS_ORCHESTRATOR_LOCK_TTL_MS, DIAKOSYS_ORCHESTRATOR_RETRY_MAX_ATTEMPTS / _BASE_MS / _MAX_MS, DIAKOSYS_ORCHESTRATOR_RECOVER_ON_START`,
       `Endpoint: DIAKOSYS_ENDPOINT (highest precedence), ~/.config/diakosys/config.json "endpoint", then the documented safe default (http://localhost:8082/v1)`,
       "",
     ].join("\n"),
@@ -607,7 +607,6 @@ async function run(args: string[]): Promise<void> {
       agent: config.agent,
       port: config.port,
       startupTimeoutMs: config.startupTimeoutMs,
-      promptTimeoutMs: config.promptTimeoutMs,
       endpoint: config.endpoint,
     });
   }
@@ -680,13 +679,12 @@ function resolveAreaArg(args: string[]): string[] | undefined {
   return list.length > 0 ? list : undefined;
 }
 
-function liveAdapter(config: OrchestratorConfig, timeoutMs: number, configOverrides?: Record<string, unknown>): LiveOpenCodeAdapter {
+function liveAdapter(config: OrchestratorConfig, configOverrides?: Record<string, unknown>): LiveOpenCodeAdapter {
   return new LiveOpenCodeAdapter({
     projectDirectory: config.projectDirectory,
     model: config.model,
     port: config.port,
     startupTimeoutMs: config.startupTimeoutMs,
-    promptTimeoutMs: timeoutMs,
     endpoint: config.endpoint,
     ...(configOverrides !== undefined ? { configOverrides } : {}),
   });
@@ -796,14 +794,13 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
     // The discovery server is spawned read-only via DISCOVERY_SERVER_CONFIG:
     // without it the model can write files / run shell commands (session-level
     // v2 permissions are not enforced by opencode 2.2.6; see discovery.ts).
-    const discoveryAdapter = adapter ?? liveAdapter(config, config.discoveryPromptTimeoutMs, DISCOVERY_SERVER_CONFIG);
+    const discoveryAdapter = adapter ?? liveAdapter(config, DISCOVERY_SERVER_CONFIG);
     const engine = new DiscoveryEngine(discoveryAdapter, {
       repoDir: config.projectDirectory,
       model: config.model,
       dryRun,
       areas,
       maxProposalsPerArea: config.discoveryMaxProposals,
-      promptTimeoutMs: config.discoveryPromptTimeoutMs,
       // Stop between areas when the instance lock was lost (heartbeat above):
       // no further model requests are submitted, and run() skips the
       // run-manifest write, so a disowned coordinator cannot keep working or
@@ -1262,14 +1259,13 @@ async function cycle(args: string[]): Promise<void> {
     discoveryAdapter = new MockOpenCodeAdapter(mockReply);
     executionAdapter = new MockOpenCodeAdapter(mockReply);
   } else {
-    discoveryAdapter = liveAdapter(config, config.discoveryPromptTimeoutMs, DISCOVERY_SERVER_CONFIG);
+    discoveryAdapter = liveAdapter(config, DISCOVERY_SERVER_CONFIG);
     executionAdapter = new LiveOpenCodeAdapter({
       projectDirectory: directory,
       model: config.model,
       agent: config.agent,
       port: config.port,
       startupTimeoutMs: config.startupTimeoutMs,
-      promptTimeoutMs: config.promptTimeoutMs,
       endpoint: config.endpoint,
     });
   }
@@ -1288,7 +1284,6 @@ async function cycle(args: string[]): Promise<void> {
               model: config.model,
               ...(areaList !== undefined ? { areas: areaList } : {}),
               maxProposalsPerArea: config.discoveryMaxProposals,
-              promptTimeoutMs: config.discoveryPromptTimeoutMs,
             },
           }
         : {}),

@@ -54,11 +54,10 @@ export interface OpenCodePromptResult {
 export interface TurnStats {
   sessionId: string;
   /** How the turn ended from the client's perspective: a terminal event was
-   * reached ("completed"), a stream/execution error surfaced ("error"), or
-   * the client deadline won ("timeout"). */
-  outcome: "completed" | "error" | "timeout";
-  /** Event type that ended the turn; `"deadline"` when the client deadline
-   * won; null when no terminal event was observed. */
+   * reached ("completed"), or a stream/execution error surfaced ("error"). */
+  outcome: "completed" | "error";
+  /** Event type that ended the turn; null when no terminal event was
+   * observed. */
   terminalEvent: string | null;
   /** Local wall time from prompt start to snapshot emission; null when
    * unmeasurable. */
@@ -129,9 +128,9 @@ export interface OpenCodeAdapterOptions {
   /** Headless server port (default 4096, SDK default). */
   port?: number;
   hostname?: string;
-  /** ms for server startup (default 20_000) and per prompt (default 120_000). */
+  /** ms for server startup (default 20_000). There is no per-prompt
+   * deadline: a prompt runs to its terminal event or the caller cancels it. */
   startupTimeoutMs?: number;
-  promptTimeoutMs?: number;
   /** Directory of files read and edited by opencode; defaults to projectDirectory. */
   workDirectory?: string;
   /** Explicit OpenAI-compatible endpoint injected into the provider config (baseURL). */
@@ -156,7 +155,6 @@ export function parseModelString(model: string): { providerID: string; modelID: 
 }
 
 const DEFAULT_STARTUP_MS = 20_000;
-const DEFAULT_PROMPT_MS = 120_000;
 
 const PROTOCOL_ENV = "DIAKOSYS_ORCHESTRATOR_OPENCODE_PROTOCOL";
 const PROTOCOL_ENV_VALUE = "v1";
@@ -297,7 +295,7 @@ export class LiveOpenCodeAdapter implements OpenCodeAdapter {
   readonly options: Required<
     Pick<
       OpenCodeAdapterOptions,
-      "projectDirectory" | "model" | "startupTimeoutMs" | "promptTimeoutMs"
+      "projectDirectory" | "model" | "startupTimeoutMs"
     >
   > &
     OpenCodeAdapterOptions;
@@ -320,7 +318,6 @@ export class LiveOpenCodeAdapter implements OpenCodeAdapter {
       port: options.port,
       hostname: options.hostname ?? DEFAULT_HOSTNAME,
       startupTimeoutMs: options.startupTimeoutMs ?? DEFAULT_STARTUP_MS,
-      promptTimeoutMs: options.promptTimeoutMs ?? DEFAULT_PROMPT_MS,
       workDirectory: options.workDirectory ?? options.projectDirectory,
       endpoint: options.endpoint,
       configOverrides: options.configOverrides,
@@ -329,7 +326,7 @@ export class LiveOpenCodeAdapter implements OpenCodeAdapter {
 
   private async start(): Promise<void> {
     if (this.server !== null && this.client !== null) return;
-    const { hostname, port, startupTimeoutMs, promptTimeoutMs, endpoint, configOverrides } = this.options;
+    const { hostname, port, startupTimeoutMs, endpoint, configOverrides } = this.options;
     let baseConfig: Record<string, unknown> | undefined;
     if (endpoint !== undefined) {
       baseConfig = configWithEndpoint(globalOpencodeConfigPath(os.homedir()), this.modelProvider, endpoint);
@@ -460,7 +457,6 @@ export class LiveOpenCodeAdapter implements OpenCodeAdapter {
         agent: input.agent ?? this.options.agent,
         tools: input.tools,
         model: parseModelString(this.options.model),
-        promptTimeoutMs: this.options.promptTimeoutMs,
       });
     }
     const v2client = client as V2Client;
@@ -469,7 +465,6 @@ export class LiveOpenCodeAdapter implements OpenCodeAdapter {
       title: input.title,
       description: input.description,
       projectDirectory: input.directory,
-      promptTimeoutMs: this.options.promptTimeoutMs,
     });
   }
 
@@ -528,7 +523,6 @@ export class MockOpenCodeAdapter implements OpenCodeAdapter {
       port: undefined,
       hostname: undefined,
       startupTimeoutMs: undefined,
-      promptTimeoutMs: undefined,
       workDirectory: undefined,
       endpoint: undefined,
     };

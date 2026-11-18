@@ -17,10 +17,7 @@ export interface OrchestratorConfig {
   endpoint: string;
   port: number;
   startupTimeoutMs: number;
-  promptTimeoutMs: number;
   agent?: string;
-  /** read-only analysis prompt timeout */
-  discoveryPromptTimeoutMs: number;
   /** max validated proposals kept per discovery area */
   discoveryMaxProposals: number;
   /** max areas analyzed per discovery run */
@@ -253,13 +250,14 @@ export function resolveConfig(): OrchestratorConfig {
     endpoint: resolveEndpoint(),
     port: num("DIAKOSYS_ORCHESTRATOR_PORT", DEFAULT_PORT),
     startupTimeoutMs: num("DIAKOSYS_ORCHESTRATOR_STARTUP_TIMEOUT_MS", DEFAULT_STARTUP_TIMEOUT_MS),
-    promptTimeoutMs: num("DIAKOSYS_ORCHESTRATOR_PROMPT_TIMEOUT_MS", DEFAULT_PROMPT_TIMEOUT_MS),
     agent: env("DIAKOSYS_ORCHESTRATOR_AGENT") ?? savedString(user?.agent),
-    discoveryPromptTimeoutMs: num("DIAKOSYS_ORCHESTRATOR_DISCOVERY_TIMEOUT_MS", DEFAULT_DISCOVERY_TIMEOUT_MS),
     discoveryMaxProposals: num("DIAKOSYS_ORCHESTRATOR_DISCOVERY_MAX_PROPOSALS", DEFAULT_DISCOVERY_MAX_PROPOSALS),
     discoveryMaxAreas: num("DIAKOSYS_ORCHESTRATOR_DISCOVERY_MAX_AREAS", DEFAULT_DISCOVERY_MAX_AREAS),
   };
-  const taskLeaseTtlMs = num("DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS", 2 * Math.max(base.promptTimeoutMs, base.discoveryPromptTimeoutMs));
+  // The lease used to be sized from the two prompt deadlines; with no
+  // per-prompt deadline left, it is a standalone constant (overridable via
+  // DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS).
+  const taskLeaseTtlMs = num("DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS", DEFAULT_TASK_LEASE_TTL_MS);
   return {
     ...base,
     lockTtlMs: num("DIAKOSYS_ORCHESTRATOR_LOCK_TTL_MS", Math.max(120_000, 2 * taskLeaseTtlMs)),
@@ -276,8 +274,7 @@ export function resolveConfig(): OrchestratorConfig {
 const DEFAULT_PROJECT_DIR = process.cwd();
 const DEFAULT_PORT = 4096;
 const DEFAULT_STARTUP_TIMEOUT_MS = 20_000;
-const DEFAULT_PROMPT_TIMEOUT_MS = 600_000;
-const DEFAULT_DISCOVERY_TIMEOUT_MS = 420_000;
+export const DEFAULT_TASK_LEASE_TTL_MS = 1_200_000;
 const DEFAULT_DISCOVERY_MAX_PROPOSALS = 3;
 const DEFAULT_DISCOVERY_MAX_AREAS = 8;
 export const ALL_DISCOVERY_AREAS = [

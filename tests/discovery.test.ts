@@ -57,7 +57,7 @@ test("engine collects proposals from all listed areas", async () => {
     return JSON.stringify([proposal("Shorten the unbounded history buffers", 5, "medium", "src/main/java/io/diakosys/HealthSampler.java")]);
   });
   try {
-    const engine = new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 1, promptTimeoutMs: 5000, cacheDir: tmpCache(), areas: ["reliability", "performance"] });
+    const engine = new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 1, cacheDir: tmpCache(), areas: ["reliability", "performance"] });
     const result = await engine.run();
     assert.equal(result.areas.length, 2);
     assert.equal(result.areas[0]!.area, "reliability");
@@ -79,7 +79,7 @@ test("engine reports malformed proposal segments instead of failing", async () =
     JSON.stringify([proposal("Guard evaluator against NaN samples", 6, "low")]),
   ].join("\n"));
   try {
-    const engine = new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 1, promptTimeoutMs: 5000, cacheDir: tmpCache(), areas: ["reliability"] });
+    const engine = new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 1, cacheDir: tmpCache(), areas: ["reliability"] });
     const result = await engine.run();
     assert.equal(result.areas[0]!.status, "ok");
     assert.equal(result.areas[0]!.proposals.length, 1);
@@ -97,7 +97,7 @@ test("engine marks the area with an error when the model fails", async () => {
     throw new Error("model exploded");
   });
   try {
-    const engine = new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 2, promptTimeoutMs: 5000, cacheDir: tmpCache(), areas: ["reliability"] });
+    const engine = new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 2, cacheDir: tmpCache(), areas: ["reliability"] });
     const result = await engine.run();
     assert.equal(result.areas[0]!.status, "error");
     assert.match(result.areas[0]!.error ?? "", /model exploded/);
@@ -115,7 +115,6 @@ test("engine rejects cross-area duplicates and per-area proposal limits", async 
       model: MODEL,
       areas: ["reliability", "performance"],
       maxProposalsPerArea: 1,
-      promptTimeoutMs: 5000,
       cacheDir: tmpCache(),
     });
     const result = await engine.run();
@@ -134,7 +133,7 @@ test("engine skips a repository without a discoverable manifest", async () => {
   fs.rmSync(path.join(dir, "src/main/java/io/diakosys/HealthEvaluator.java"));
   const adapter = new MockOpenCodeAdapter((i) => "no findings");
   try {
-    const engine = new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 2, promptTimeoutMs: 5000, cacheDir: tmpCache(), areas: ["reliability"] });
+    const engine = new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 2, cacheDir: tmpCache(), areas: ["reliability"] });
     const result = await engine.run();
     assert.equal(result.areas[0]!.proposals.length, 0);
   } finally {
@@ -350,7 +349,7 @@ test("engine never creates, modifies or deletes tasks", async () => {
   const dir = tmpRepo();
   const adapter = new MockOpenCodeAdapter((i) => "mock");
   try {
-    const engine = new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 2, promptTimeoutMs: 5000, cacheDir: tmpCache(), areas: ["reliability"] });
+    const engine = new DiscoveryEngine(adapter, { repoDir: dir, model: MODEL, maxProposalsPerArea: 2, cacheDir: tmpCache(), areas: ["reliability"] });
     const result = await engine.run();
     assert.equal(result.proposals.length, 0);
   } finally {

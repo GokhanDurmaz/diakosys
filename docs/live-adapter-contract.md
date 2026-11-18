@@ -52,7 +52,7 @@ Prompt flow (per prompt, in order)
    JSON-parsed and yielded. `{"type":"session.idle","properties":{"sessionID":
    <id>}}` ends the loop successfully; `{"type":"session.error",…}` ends it with
    the error message surfaced; a stream that **ends without `session.idle`**
-   fails with `opencode prompt timed out after <promptTimeoutMs>ms`.
+   fails with `opencode prompt returned no terminal event`.
 5. `GET /session/{id}/message` → array of `{ info, parts }`. The adapter takes the
    **last** message with `info.role === "assistant"`, joins the `text` fields of
    its parts with spaces (tool parts are skipped for the text but passed through
@@ -77,8 +77,12 @@ Error handling / timeouts
 - HTTP errors surface as rejections whose messages embed the parsed error body
   (non-2xx is a result envelope `{ error: parsedBody }` in the SDK, not an
   exception).
-- The prompt timeout is enforced by the adapter's own timer via the SSE iterator;
-  there is no client-side fetch timeout (`req.timeout = false` in the SDK client).
+- The adapter has no per-prompt deadline: a prompt runs to its terminal event
+  (`session.idle`, `session.status`, `session.error`, `session.execution.failed`)
+  or until the caller cancels it. The SDK client disables its own fetch timeout
+  (`req.timeout = false`), so the only failure is a stream that ends without a
+  terminal event — reported as `opencode prompt returned no terminal event
+  (session <id>)`.
 
 Doctor probe flow (subprocess, real CLI)
 

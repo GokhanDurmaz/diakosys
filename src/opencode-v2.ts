@@ -52,7 +52,6 @@ export interface V2PromptInput {
   title: string;
   description: string;
   projectDirectory: string;
-  promptTimeoutMs: number;
 }
 
 export interface V2ServerOptions extends ServerOptions {
@@ -453,7 +452,7 @@ function createTurnStatsCollector(sessionId: string): TurnStatsCollector {
       return {
         sessionId,
         outcome,
-        terminalEvent: outcome === "timeout" ? "deadline" : (terminalType ?? null),
+        terminalEvent: terminalType ?? null,
         wallMs,
         steps,
         firstStepAtMs: firstStepAt === undefined ? null : Math.max(0, firstStepAt - startedAt),
@@ -477,49 +476,25 @@ async function v2Prompt(client: ReturnType<typeof OpenCode.make>, input: V2Promp
     .filter(Boolean)
     .join("\n");
 
-  // ONE deadline bounds the whole operation: the prompt POST, the wait for a
-  // terminal SSE event, and the final assistant-message read. The deadline
-  // aborts the signal handed to every request: the generated client forwards
-  // `requestOptions.signal` into the fetch init (promise/generated/client.d.ts,
-  // `RequestOptions.signal`), and an aborted signal rejects a pending SSE
-  // `reader.read()` (verified against the installed 2.2.7 client), which
-  // unwinds the subscriber's generator including its
-  // `finally { await reader.cancel() }`. The subscriber's AsyncIterable is NOT
-  // relied on for cleanup: `.return()` cannot unstick a read that never
-  // settles.
-  const controller = new AbortController();
-  const timeoutError = new Error(
-    `opencode prompt timed out after ${input.promptTimeoutMs}ms (session ${input.sessionId})`,
-  );
-  let timer: NodeJS.Timeout | undefined;
-  const timedOut = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      controller.abort(timeoutError);
-      reject(timeoutError);
-    }, input.promptTimeoutMs);
-  });
-
-  // Subscribe BEFORE firing the prompt so no early events are lost. The
-  // shared-events `subscribe(options?: SubscribeOptions)` carries the abort
-  // signal inside the options object (`signal?: AbortSignal`), which the
-  // underlying SSE fetch consumes.
-  const events = client.event.subscribe({ signal: controller.signal });
+  // There is no client-side deadline. The server is expected to emit a
+  // terminal event (`session.status` idle / `session.error` /
+  // `session.execution.failed`); the prompt waits for one and then reads the
+  // final assistant message. Every exit path returns the SSE subscription so
+  // the stream is disposed (see the finally block).
+  const events = client.event.subscribe({});
 
   // Turn statistics are collected from the events this prompt already
   // receives — no extra request. The collector lives in THIS scope (not the
-  // consumer task's) so the deadline path can still snapshot the partial
-  // statistics after the consumer has been abandoned.
+  // consumer task's) so the snapshot can still be attached after an error.
   const stats = createTurnStatsCollector(input.sessionId);
 
-  // The consumer runs as its own task so the deadline can abandon it: the
-  // post-race `.catch` in the finally block keeps an abort-induced rejection
-  // (e.g. the aborted SSE read surfacing as ClientError Transport) from
-  // becoming an unhandled rejection, while a genuine pre-timeout failure
-  // propagates through the race untouched.
+  // The consumer is awaited directly inside the try block below: its
+  // rejection is either propagated as a genuine error or wrapped, never left
+  // to become an unhandled rejection.
   const consume = (async (): Promise<OpenCodePromptResult> => {
     // The inbox acknowledgement carries no error field; a transport-level
     // failure surfaces as a thrown ClientError instead.
-    await client.session.prompt({ sessionID: input.sessionId, text }, { signal: controller.signal });
+    await client.session.prompt({ sessionID: input.sessionId, text });
 
     let terminalEvent: { type: string; data?: unknown } | undefined;
     let streamErrorMessage: string | undefined;
@@ -550,20 +525,21 @@ async function v2Prompt(client: ReturnType<typeof OpenCode.make>, input: V2Promp
     }
 
     if (!terminalEvent) {
-      throw new Error(streamErrorMessage ?? timeoutError.message);
+      throw new Error(
+        streamErrorMessage !== undefined
+          ? `opencode prompt ended with a session error (session ${input.sessionId}): ${streamErrorMessage}`
+          : `opencode prompt returned no terminal event (session ${input.sessionId})`,
+      );
     }
 
     // Reading the final assistant message is part of the same prompt
-    // operation, so the deadline covers it too. The list MUST be requested in
-    // chronological order explicitly: the server's default is newest-first
-    // (verified against opencode 2.2.6 — an omitted `order` returns the same
-    // sequence as "desc"), so the old `data[data.length - 1]` picked the
-    // OLDEST assistant message — the model's first step (often tool calls
-    // with empty text) — and discarded the actual deliverable.
-    const messages = await client.message.list(
-      { sessionID: input.sessionId, type: "assistant", order: "asc" },
-      { signal: controller.signal },
-    );
+    // operation. The list MUST be requested in chronological order explicitly:
+    // the server's default is newest-first (verified against opencode 2.2.6 —
+    // an omitted `order` returns the same sequence as "desc"), so the old
+    // `data[data.length - 1]` picked the OLDEST assistant message — the
+    // model's first step (often tool calls with empty text) — and discarded
+    // the actual deliverable.
+    const messages = await client.message.list({ sessionID: input.sessionId, type: "assistant", order: "asc" });
     const assistant = messages.data[messages.data.length - 1] as SessionMessageAssistant;
     if (assistant === undefined) {
       throw new Error(`opencode session ${input.sessionId} has no assistant message`);
@@ -581,29 +557,29 @@ async function v2Prompt(client: ReturnType<typeof OpenCode.make>, input: V2Promp
   })();
 
   try {
-    const result = await Promise.race([consume, timedOut]);
+    const result = await consume;
     attachTurnStats(result, stats, "completed");
     return result;
   } catch (error) {
-    // The deadline error carries its own diagnostic; genuine SDK/stream
-    // errors are wrapped so the HTTP reason/detail survive into the
-    // diagnostic (see toOpencodeError). Both rejections carry the turn's
-    // statistics snapshot (attached above by attachTurnStats).
-    if (error === timeoutError) {
-      // The deadline won: snapshot whatever partial statistics accumulated
-      // BEFORE the abandoned consumer's state is lost, and let them travel
-      // with the original timeout error so the caller can still emit them.
-      attachTurnStats(timeoutError, stats, "timeout");
-      throw timeoutError;
-    }
+    // Genuine SDK/stream errors are wrapped so the HTTP reason/detail
+    // survives into the diagnostic (see toOpencodeError). The snapshot
+    // travels with the wrapped error so the caller can still emit it.
     const wrapped = toOpencodeError(error, input.sessionId);
     attachTurnStats(wrapped, stats, "error");
     throw wrapped;
   } finally {
-    clearTimeout(timer);
-    // If the deadline won, consume is still unwinding; its abort-induced
-    // rejection must never surface as an unhandled rejection.
-    consume.catch(() => undefined);
+    // Dispose the SSE subscription on every exit path (success, stream
+    // error, or consumer unwind). Without a signal to unwind the generator
+    // through, returning the iterable is the only explicit cleanup the
+    // client exposes; a read that never settles simply keeps running.
+    // AsyncIterable has no return() — dispose through the async-iterator
+    // protocol, the same way the SDK's own subscription wrapper unwinds
+    // its subscriber. Both the iterable and its optional return method are
+    // guarded, and the disposal result is never left as an unhandled
+    // rejection.
+    const iterator: AsyncIterator<unknown> | undefined = events[Symbol.asyncIterator]?.();
+    const disposeResult = iterator?.return?.();
+    if (disposeResult !== undefined) void disposeResult.catch(() => undefined);
   }
 }
 
