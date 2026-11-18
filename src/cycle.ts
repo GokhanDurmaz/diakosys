@@ -235,6 +235,10 @@ export async function runCycle(options: CycleOptions): Promise<CycleSummary> {
           maxProposalsPerArea: d.maxProposalsPerArea,
           ...(d.areas !== undefined ? { areas: selectAreas(d.areas).map((a) => a.key) } : {}),
           ...(d.cacheDir !== undefined ? { cacheDir: d.cacheDir } : {}),
+          // Stop between areas (and skip the run-manifest write) once this
+          // cycle's lock heartbeat has reported the instance lock lost — a
+          // disowned coordinator must not keep submitting model requests.
+          shouldStop: () => summary.disowned,
         });
         const result = await engine.run();
         persistProposals(

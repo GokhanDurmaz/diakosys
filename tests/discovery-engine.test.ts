@@ -1127,6 +1127,57 @@ test("a never-settling abort cannot stall discovery past the grace period", asyn
   }
 });
 
+// ——— evidence preparation must never abort the run (per-area isolation) ———
+// A symlinked directory inside the walked roots used to be pushed into the
+// manifest as a plain file (readdir's dirent reports the link itself, not the
+// target), and extractSourceEvidence's readFileSync of it threw EISDIR —
+// aborting the ENTIRE run before any area could complete.
+
+test("a symlinked directory in the repo never aborts the run: both areas still complete", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  // a symlinked directory under src/main: a real directory behind a link
+  const target = path.join(dir, "linked-target");
+  fs.mkdirSync(target, { recursive: true });
+  fs.writeFileSync(path.join(target, "Nested.java"), "class Nested {}");
+  fs.symlinkSync(target, path.join(dir, "src/main/java/io/diakosys/Linked"));
+  // a second real source file so the two areas cite DIFFERENT primary files —
+  // the engine deduplicates proposals across areas by primary evidence file,
+  // and this test is about the symlink never aborting the run, not dedupe
+  fs.writeFileSync(path.join(dir, "src/main/java/io/diakosys/Sampler.java"), "class Sampler { void evaluate() {} }");
+  const adapter = new MockOpenCodeAdapter((input) => {
+    if (input.title === "Discovery: architecture") {
+      return JSON.stringify([proposal("Guard evaluator against NaN samples", 6, "low")]);
+    }
+    return JSON.stringify([proposal("Track sampler test coverage", 4, "medium", "src/main/java/io/diakosys/Sampler.java")]);
+  });
+  try {
+    const result = await new DiscoveryEngine(adapter, {
+      repoDir: dir,
+      model: MODEL,
+      maxProposalsPerArea: 1,
+      promptTimeoutMs: 5000,
+      cacheDir,
+      dryRun: true,
+      areas: ["architecture", "tests"],
+    }).run();
+    // neither area may fail, and neither may the run: the pre-fix behaviour
+    // threw EISDIR out of run() before any area completed
+    assert.equal(result.areas[0]?.status, "ok", `architecture must complete: ${result.areas[0]?.error ?? ""}`);
+    assert.equal(result.areas[1]?.status, "ok", `tests must complete: ${result.areas[1]?.error ?? ""}`);
+    assert.equal(result.proposals.length, 2, "both areas' proposals survive");
+    // the symlinked directory must not enter any prompt manifest: it is not a
+    // readable file, so it is excluded at the walk, not read and failed on
+    for (const call of adapter.calls) {
+      assert.ok(!call.description.includes("Linked"), "the symlinked directory must not appear in the manifest");
+    }
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ——— turn-statistics lifecycle emission (observability only) ———
 // The v2 backend attaches one aggregated TurnStats snapshot to each prompt's
 // result or rejection; runArea emits it as exactly ONE lifecycle event per

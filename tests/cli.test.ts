@@ -1427,7 +1427,7 @@ test("discover --dry-run prints proposals and persists nothing (no database, no 
         `  evidence: src/queue.ts`,
         `  problem: An in-transaction candidate followed by a zero-row claim UPDATE is an invariant violation.`,
         `  verify: npm test`,
-        `dry run — nothing was persisted`,
+        `dry run — no proposals or discovery runs were persisted (operational writes: database + coordinator lock)`,
       ].join("\n") + "\n",
     );
     // A dry run still opens the database — only to acquire the coordinator
@@ -1700,7 +1700,7 @@ test("discover --dry-run also exits 1 when an area fails (same contract as the p
     assert.equal(r.code, 1, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
     assert.equal(r.stderr, "");
     assert.match(r.stdout, /^area tests: ERROR — failed to create opencode session: /m);
-    assert.match(r.stdout, /^no proposals \(dry run — nothing was persisted\)$/m);
+    assert.match(r.stdout, /^no proposals \(dry run — no proposals or discovery runs were persisted \(operational writes: database \+ coordinator lock\)\)$/m);
   } finally {
     await stub.close();
   }
@@ -1913,7 +1913,7 @@ test("discover --dry-run --area quality prints the post-audit rejection (no life
     const r = await runStubbed("discover", ["--dry-run", "--area", "quality"], dbPath, home, stub.url);
     assert.equal(r.code, 0, `stdout: ${r.stdout}\nstderr: ${r.stderr}`);
     assert.equal(r.stderr, "");
-    assert.equal(r.stdout, `area quality: ok (0 proposals, 1 rejected)\nno proposals (dry run — nothing was persisted)\n  rejected: Claim the lease before it expires — observation in src/queue.ts is not supported by the file's contents\n`);
+    assert.equal(r.stdout, `area quality: ok (0 proposals, 1 rejected)\nno proposals (dry run — no proposals or discovery runs were persisted (operational writes: database + coordinator lock))\n  rejected: Claim the lease before it expires — observation in src/queue.ts is not supported by the file's contents\n`);
   } finally {
     await stub.close();
   }
@@ -1955,7 +1955,7 @@ test("discover --dry-run --area 'quality,tests' attributes the rejection to ever
     // level.
     assert.match(lines[0] ?? "", /^area tests: ok \(0 proposals, 1 rejected\)$/);
     assert.match(lines[1] ?? "", /^area quality: ok \(0 proposals, 1 rejected\)$/);
-    assert.equal(lines[2], "no proposals (dry run — nothing was persisted)", "dry run prints no run summary");
+    assert.equal(lines[2], "no proposals (dry run — no proposals or discovery runs were persisted (operational writes: database + coordinator lock))", "dry run prints no run summary");
     assert.match(lines[3] ?? "", /^  rejected: Claim the lease before it expires — duplicate primary file src\/queue\.ts in this run$/);
     assert.match(lines[4] ?? "", /^  rejected: Claim the lease before it expires — observation in src\/queue\.ts is not supported by the file's contents$/);
     assert.equal(lines[5], "", "no trailing output");
@@ -2088,7 +2088,7 @@ test("discover --dry-run still creates no manifest after the post-audit re-persi
     // accepted channel and is counted as rejected. (The old expectation of
     // "2 proposals, 0 rejected" was the pre-audit count this fix removes.)
     assert.match(r.stdout, /^area architecture: ok \(1 proposals, 1 rejected\)/);
-    assert.match(r.stdout, /^dry run — nothing was persisted$/m);
+    assert.match(r.stdout, /^dry run — no proposals or discovery runs were persisted \(operational writes: database \+ coordinator lock\)$/m);
 
     // A dry run must never write the run manifest, even though the CLI now
     // re-persists the audited result for normal runs.

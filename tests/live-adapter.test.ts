@@ -915,7 +915,7 @@ test(
           `  evidence: src/queue.ts`,
           `  problem: An in-transaction candidate followed by a zero-row claim UPDATE is an invariant violation.`,
           `  verify: npm test`,
-          `dry run — nothing was persisted`,
+          `dry run — no proposals or discovery runs were persisted (operational writes: database + coordinator lock)`,
         ].join("\n") + "\n",
       );
 

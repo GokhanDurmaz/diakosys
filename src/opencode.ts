@@ -96,6 +96,18 @@ export interface OpenCodeAdapter {
   readonly kind: "live" | "mock";
   readonly options: OpenCodeAdapterOptions;
   probe(): Promise<string>;
+  /**
+   * Create a brand-new session and switch the adapter to it, returning its
+   * id. Every subsequent prompt() uses it until the next beginSession().
+   *
+   * Optional on purpose: adapters that never call it keep the previous
+   * contract (the first prompt() lazily creates the one session it reuses —
+   * see LiveOpenCodeAdapter.ensureSession). The discovery engine calls it
+   * once per area so each area gets its own conversation history (an area's
+   * prompts, responses and tool rounds must never leak into another area);
+   * a failure here is reported against the area that requested the session.
+   */
+  beginSession?(): Promise<string>;
   prompt(input: {
     title: string;
     description: string;
@@ -370,18 +382,36 @@ export class LiveOpenCodeAdapter implements OpenCodeAdapter {
   /**
    * Create the first session and remember its id; every prompt after that
    * reuses it. Without this the server would receive an empty session id on
-   * the first prompt.
+   * the first prompt. Callers that need a fresh conversation (discovery, one
+   * per area) go through beginSession() instead.
    */
   private async ensureSession(): Promise<string> {
     if (this.currentSessionId !== null) return this.currentSessionId;
+    return this.createSession();
+  }
+
+  /** Create a session and make it the current one; the only create call site. */
+  private async createSession(): Promise<string> {
     const client = this.client;
     if (client === null || this.server === null) {
       throw new Error("opencode adapter not started");
     }
     // create() is the only session-creating call; callers must go through
-    // this method so the same session is reused across prompts.
+    // ensureSession()/beginSession() so session ids stay tracked accurately.
     this.currentSessionId = await client.create();
     return this.currentSessionId;
+  }
+
+  /**
+   * Start (if needed) and create a NEW session, replacing the current one.
+   * Used by the discovery engine so every area runs in its own session: no
+   * prompt/response history from a previous area is visible to the next.
+   * A create failure rejects with the underlying client error — the caller
+   * (the engine) attributes it to the area that asked for the session.
+   */
+  async beginSession(): Promise<string> {
+    await this.start();
+    return this.createSession();
   }
 
   /** Check connectivity without running a prompt; returns the server URL. */
@@ -476,9 +506,14 @@ export class MockOpenCodeAdapter implements OpenCodeAdapter {
   readonly options: OpenCodeAdapterOptions;
   readonly calls: Array<{ title: string; description: string; directory: string; agent?: string }> = [];
   readonly aborted: Array<string | undefined> = [];
+  /** Session ids handed out by beginSession(), in call order — lets tests
+   *  assert one distinct session per discovery area. */
+  readonly createdSessions: string[] = [];
   private readonly reply: (input: { title: string; description: string; directory: string }) =>
     | string
     | Promise<string>;
+  private sessionSeq = 0;
+  private currentSessionId = "ses_mock";
 
   constructor(
     reply: (input: { title: string; description: string; directory: string }) =>
@@ -503,6 +538,13 @@ export class MockOpenCodeAdapter implements OpenCodeAdapter {
     return "mock:localhost:4096";
   }
 
+  async beginSession(): Promise<string> {
+    this.sessionSeq += 1;
+    this.currentSessionId = `ses_mock_${this.sessionSeq}`;
+    this.createdSessions.push(this.currentSessionId);
+    return this.currentSessionId;
+  }
+
   async prompt(input: {
     title: string;
     description: string;
@@ -518,7 +560,7 @@ export class MockOpenCodeAdapter implements OpenCodeAdapter {
     return {
       // Same id activeSessionId() reports, mirroring the live adapter where
       // result.sessionId === activeSessionId() (runner.ts records the former).
-      sessionId: "ses_mock",
+      sessionId: this.currentSessionId,
       finish: String(info.finish),
       role: String(info.role),
       text: reply,
@@ -531,7 +573,7 @@ export class MockOpenCodeAdapter implements OpenCodeAdapter {
   }
 
   activeSessionId(): string | undefined {
-    return "ses_mock";
+    return this.currentSessionId;
   }
 
   async close(): Promise<void> {

@@ -31,7 +31,14 @@ import { persistProposals } from "./persist.ts";
 import { runCycle } from "./cycle.ts";
 import { LifecycleLogger, type LifecycleEvent } from "./lifecycle.ts";
 import type { Proposal } from "./proposal.ts";
-import { acquireInstanceLock, releaseInstanceLock, renewInstanceLock, coordinatorOwner } from "./coordinator.ts";
+import {
+  acquireInstanceLock,
+  releaseInstanceLock,
+  renewInstanceLock,
+  holdsInstanceLock,
+  coordinatorOwner,
+  CoordinatorDisownedError,
+} from "./coordinator.ts";
 import type { CoordinatorAuthority } from "./locks.ts";
 import {
   recoverInterruptedTasks,
@@ -693,6 +700,17 @@ function liveAdapter(config: OrchestratorConfig, timeoutMs: number, configOverri
  * behaviour — or want to prove the error paths release their resources — may
  * pass a mock.
  */
+/**
+ * Dry-run note. A dry run DOES perform operational writes — it opens the
+ * database file and acquires/renews/releases the coordinator instance lock —
+ * so "nothing was persisted" would be false. The note names exactly what a
+ * dry run does not write (proposals → tasks, discovery runs, the run
+ * manifest) and what it does (database + coordinator lock), so the pinned
+ * output contract cannot be mistaken for a fully write-free run.
+ */
+const DRY_RUN_NOTE =
+  "dry run — no proposals or discovery runs were persisted (operational writes: database + coordinator lock)";
+
 export async function discover(args: string[], adapter?: OpenCodeAdapter): Promise<void> {
   const dryRun = args.includes("--dry-run");
   let config: OrchestratorConfig;
@@ -726,6 +744,10 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
   // database follows it, so the lock row is still writable at release time.
   let db: DatabaseSync | undefined = undefined;
   let authority: CoordinatorAuthority | undefined;
+  // Lock heartbeat handle (outermost scope so the outermost finally can stop
+  // it before the lock is released) and the write-refusal flag it raises.
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let persistenceRefused = false;
   let result;
   let acceptedCount = 0;
   const acceptedIds: string[] = [];
@@ -742,6 +764,33 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
       return;
     }
 
+    // Coordinator heartbeat: a discovery prompt can run for minutes per area
+    // (the prompt timeout alone defaults to 420s), far past the instance-lock
+    // TTL, so the lock is renewed on the same TTL/3 cadence `run` and `cycle`
+    // use. A failed renewal means the lock was lost or stolen: `lockLost`
+    // stops the engine between areas (via shouldStop below) and refuses every
+    // persistence path below — a disowned coordinator must not write.
+    let lockLost = false;
+    heartbeat = setInterval(() => {
+      if (db === undefined || authority === undefined) return;
+      if (renewInstanceLock(db, authority)) return;
+      if (lockLost) return;
+      lockLost = true;
+      process.stderr.write("instance lock lost — stopping discovery; refusing to persist results\n");
+      lifecycle?.log("ERROR", "discover", "lock", "lost", {
+        detail: "instance lock lost — stopping discovery; refusing to persist results",
+      });
+    }, Math.max(1000, Math.floor(config.lockTtlMs / 3)));
+    // Ownership probe used before each area and before every write: mirrors
+    // the guard's predicate (owner + generation + unexpired) without renewing,
+    // so a lock that a guarded write would refuse is also refused here.
+    const stillHoldsLock = (): boolean =>
+      db !== undefined && authority !== undefined && holdsInstanceLock(db, authority);
+    // Single refusal predicate for cancellation (shouldStop) and for the
+    // persistence gates below: either the heartbeat already observed a failed
+    // renewal, or the row no longer belongs to us right now.
+    const lockRefused = (): boolean => lockLost || !stillHoldsLock();
+
     // `adapter ?? liveAdapter(...)`: the seam above is optional — the CLI
     // entry point builds the live adapter here, test callers may pass a mock.
     // The discovery server is spawned read-only via DISCOVERY_SERVER_CONFIG:
@@ -755,6 +804,11 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
       areas,
       maxProposalsPerArea: config.discoveryMaxProposals,
       promptTimeoutMs: config.discoveryPromptTimeoutMs,
+      // Stop between areas when the instance lock was lost (heartbeat above):
+      // no further model requests are submitted, and run() skips the
+      // run-manifest write, so a disowned coordinator cannot keep working or
+      // persist a partial run.
+      shouldStop: () => lockRefused(),
       // Interactive runs report which area is being analyzed — without this a
       // slow model run looks like a frozen process for the whole prompt
       // timeout. Scripted runs (piped stdout) keep the pinned output contract.
@@ -844,10 +898,28 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
     // still carries the pre-audit proposal set. Re-persist the audited result
     // so the resumable-run manifest matches the verdicts that were reported:
     // only VALID proposals are accepted, and the auditor's rejections are
-    // recorded in the manifest's existing `rejected` array.
-    if (dryRun !== true) {
+    // recorded in the manifest's existing `rejected` array. Gated on still
+    // holding the instance lock: a run the model finished after lock loss
+    // must not be written either.
+    if (dryRun !== true && !lockRefused()) {
       result.persisted = await engine.persist(result, engine.cacheDir);
     }
+
+    // One refusal path for the pre-write gate and for a mid-write
+    // CoordinatorDisownedError: report on stderr (unless the heartbeat
+    // already reported the loss), fail the command, and skip every remaining
+    // write. Nothing below this point touches the database or the manifest.
+    const refusePersistence = (): void => {
+      persistenceRefused = true;
+      process.exitCode = 1;
+      if (!lockLost) {
+        lockLost = true;
+        process.stderr.write("instance lock lost — refusing to persist discovery results\n");
+        lifecycle?.log("ERROR", "discover", "lock", "lost", {
+          detail: "instance lock lost — refusing to persist discovery results",
+        });
+      }
+    };
 
     for (const area of result.areas) {
       process.stdout.write(
@@ -860,11 +932,18 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
       // read as failure. (A dry run that failed every area used to exit 0 —
       // observed live with the 420s model prompt timeout.)
       if (result.areas.some((a) => a.status === "error")) process.exitCode = 1;
-      printProposals(result.areas, result.proposals, "dry run — nothing was persisted");
+      printProposals(result.areas, result.proposals, DRY_RUN_NOTE);
+    } else if (lockRefused()) {
+      // Pre-write ownership check: the model run outlasted the lock (or the
+      // heartbeat already saw it taken). The guarded transactions below would
+      // throw anyway — refuse here so the refusal is reported once, before
+      // any write is attempted.
+      refusePersistence();
     } else {
-      fs.mkdirSync(path.dirname(defaultDbPath()), { recursive: true });
-      const store = new TaskStore(db);
-      const runs = new DiscoveryRunStore(db);
+      try {
+        fs.mkdirSync(path.dirname(defaultDbPath()), { recursive: true });
+        const store = new TaskStore(db);
+        const runs = new DiscoveryRunStore(db);
         const runId = runs.start(discoveryAreas, config.model, authority);
         persistProposals(store, result, { model: config.model }, authority, (id: string) => {
           acceptedCount++;
@@ -887,10 +966,20 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
             : `area failures: ${failedAreas.map((a) => `${a.area}: ${String(a.error).slice(0, 120)}`).join("; ")}`,
         );
         if (failedAreas.length > 0) process.exitCode = 1;
+      } catch (err) {
+        // The lock can be lost between the gate above and (or inside) the
+        // guarded transactions: report the refusal distinctly instead of
+        // surfacing the raw guard error, and leave the writes uncompleted.
+        if (err instanceof CoordinatorDisownedError) refusePersistence();
+        else throw err;
+      }
     }
   } finally {
-    // Outermost release: every exit path (dry run, persistence, early
-    // `return`, engine error) must hand the lock back.
+    // Outermost release: stop the heartbeat BEFORE handing the lock back so a
+    // queued renewal cannot fire against a released (or stolen) lock row, then
+    // release on every exit path (dry run, persistence, refusal, early
+    // `return`, engine error).
+    if (heartbeat !== undefined) clearInterval(heartbeat);
     if (db !== undefined && authority !== undefined) {
       releaseInstanceLock(db, authority.owner);
     }
@@ -906,14 +995,15 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
   // only exist after the persistProposals callback runs, so the ids are
   // collected there rather than read off result.proposals (which has no id
   // field). A dry run prints neither the accepted ids nor the run summary —
-  // it only prints the proposals and the "nothing was persisted" note.
+  // it only prints the proposals and the dry-run note. A refused run (lock
+  // lost) prints no "run stored" summary either: nothing was stored.
   for (const id of acceptedIds) {
     process.stdout.write(`accepted ${id}\n`);
   }
   for (const rejected of result.rejected) {
     process.stdout.write(`  rejected: ${rejected.raw} — ${rejected.reason}\n`);
   }
-  if (!dryRun) {
+  if (!dryRun && !persistenceRefused) {
     process.stdout.write(
       `discovery run completed: ${acceptedCount} tasks created from ${result.proposals.length} proposals (${result.rejected.length} rejected); run stored\n`,
     );

@@ -9,7 +9,9 @@
  * What the auditor CAN establish (filesystem-grounded only):
  *   * a cited file is readable and a cited symbol appears in it;
  *   * an observation's key terms are present in the file it cites;
- *   * a claimed behavior is exercised by an existing test file (already covered);
+ *   * a claimed behaviour's terms are shared with an existing project test
+ *     file (already covered: at least two behaviour terms in one test file —
+ *     a single shared term is incidental vocabulary, not coverage);
  *   * two proposals in one run describe the same behavior (duplicate/overlap).
  * What it CANNOT establish (and therefore never claims):
  *   * whether a test would pass once written;
@@ -23,6 +25,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { SKIP_DIRS } from "./discovery.ts";
 import type { RejectedProposal } from "./discovery.ts";
 import type { Proposal } from "./proposal.ts";
 
@@ -147,17 +150,32 @@ function auditProposal(proposal: Proposal, repoDir: string, seen: Set<string>): 
  * existing test file? Returns the covering test location, or undefined when
  * no coverage was found. The scan covers the whole repository, not just the
  * files the proposal cited — a test it never referenced may still cover the
- * claim. The file list is memoized so it is computed once per run.
+ * claim. Dependency and generated directories (node_modules, dist, target, …
+ * — discovery's SKIP_DIRS) are excluded: coverage evidence must come from the
+ * project's own tests, not from vendored content. The file list is memoized
+ * so it is computed once per run.
  */
 const testFileCache = new Map<string, string[]>();
 function testFilesInRepo(repoDir: string): string[] {
   if (testFileCache.has(repoDir)) return testFileCache.get(repoDir) ?? [];
   const files: string[] = [];
   const walk = (dir: string): void => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // an unreadable directory is skipped, never fatal to the audit
+    }
+    for (const entry of entries) {
+      // hidden and dependency/generated directories never carry project
+      // coverage; skip them entirely (same rationale as discovery's walk)
+      if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(full);
-      else if (isTestFile(full)) files.push(full);
+      // only plain files are candidates: an unreadable or non-regular entry
+      // must never reach readFileText (a FIFO read would block, a directory
+      // read would throw)
+      else if (entry.isFile() && isTestFile(full)) files.push(full);
     }
   };
   walk(repoDir);
@@ -250,7 +268,11 @@ function areaFromPath(file: string): string {
  * existing test file? Returns the covering test location, or undefined when
  * no coverage was found. The scan covers the whole repository, not just the
  * files the proposal cited — a test it never referenced may still cover the
- * claim. The file list is memoized so it is computed once per run.
+ * claim. A file only counts as covering when at least TWO distinct behaviour
+ * terms appear in it: a single shared term is incidental vocabulary that any
+ * real test suite shares with unrelated proposals, not evidence that the
+ * claimed behaviour is exercised. The file list is memoized so it is computed
+ * once per run.
  */
 function checkAlreadyCovered(proposal: Proposal, repoDir: string): { file: string; observation: string; reason: string } | undefined {
   const terms = behaviourTerms(proposal);
@@ -258,10 +280,17 @@ function checkAlreadyCovered(proposal: Proposal, repoDir: string): { file: strin
   const testFiles = testFilesInRepo(repoDir);
   for (const testFile of testFiles) {
     const text = readFileText(repoDir, testFile) ?? "";
-    for (const term of terms) {
-      if (text.toLowerCase().includes(term)) {
-        return { file: testFile, observation: term, reason: `already covered by an existing test (${term})` };
-      }
+    const lower = text.toLowerCase();
+    // matched keeps behaviourTerms' order, so the reason lists the terms in
+    // the proposal's own order — the coverage evidence is the terms
+    // themselves, named so the rejection is checkable against the file.
+    const matched = terms.filter((term) => lower.includes(term));
+    if (matched.length >= 2) {
+      return {
+        file: testFile,
+        observation: matched.join(", "),
+        reason: `already covered by an existing test (${matched.join(", ")})`,
+      };
     }
   }
   return undefined;

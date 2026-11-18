@@ -170,6 +170,13 @@ export interface AreaResult {
   area: string;
   status: "ok" | "error";
   error?: string;
+  /**
+   * The OpenCode session this area ran in (undefined when the session was
+   * never created — evidence assembly or session creation failed first).
+   * One area = one session: ids are per-area and never reused, so logs and
+   * error reports name the exact session of the affected area.
+   */
+  sessionId?: string;
   proposals: Proposal[];
   rejected: RejectedProposal[];
   evidence: DiscoveryEvidence[];
@@ -195,6 +202,23 @@ export interface DiscoveryOptions {
   maxProposalsPerArea: number;
   promptTimeoutMs: number;
   manifestLimit?: number;
+  /**
+   * Explicit per-area prompt/context budget (chars), defaulting to
+   * MAX_AREA_PROMPT_CHARS. The assembled area prompt is measured BEFORE it
+   * is submitted: over-budget prompts are first fitted (only the manifest
+   * path listing is shortened, with an explicit note) and, if they still do
+   * not fit, the area fails with a context error naming the area and the
+   * measured size — nothing oversized is ever sent to OpenCode, and the
+   * instruction/evidence block is never silently truncated.
+   */
+  promptBudgetChars?: number;
+  /**
+   * Checked before each area starts (and before the run persists its
+   * manifest). Returning true stops the run: no further areas are started
+   * and no results are persisted — the caller's cancellation signal (e.g.
+   * the CLI's coordinator-lock heartbeat detecting lock loss).
+   */
+  shouldStop?: () => boolean;
   /**
    * Per-area progress callback, invoked (synchronously, in area order) right
    * before each area's model prompt starts. The CLI uses it to report that
@@ -374,7 +398,17 @@ export function extractSourceEvidence(repoDir: string, area: DiscoveryArea, file
   for (const file of files) {
     const abs = path.join(repoDir, file);
     if (!fs.existsSync(abs)) continue;
-    const text = fs.readFileSync(abs, "utf8");
+    let text: string;
+    try {
+      text = fs.readFileSync(abs, "utf8");
+    } catch {
+      // unreadable (permissions changed, vanished between selection and read,
+      // or an unusual entry that passed the walk): skip this file's excerpt
+      // and keep going — the same resilience the scoring read in
+      // selectFilesForArea applies. An unreadable file must never abort the
+      // area or the run.
+      continue;
+    }
     const lines = text.split("\n");
     const hits: number[] = [];
     for (let i = 0; i < lines.length; i++) {
@@ -387,14 +421,49 @@ export function extractSourceEvidence(repoDir: string, area: DiscoveryArea, file
     const start = Math.max(0, hits[0]! - 2);
     const end = Math.min(lines.length - 1, hits[hits.length - 1]! + 2);
     const snippet = lines.slice(start, end + 1).join("\n");
-    if (snippet.length > 1200) continue; // per-file cap, see MAX_SOURCE_EXCERPT_CHARS
-    excerpts.push({ file, line: start + 1, excerpt: snippet });
+    // per-file cap: an over-long excerpt is TRUNCATED, not dropped. Dropping
+    // silently removed the file's evidence from the prompt for every area
+    // without a keyword table, whose excerpt spans the whole file. The
+    // truncated excerpt stays a verbatim slice from the file's real start
+    // line, so the evidence remains checkable against the source.
+    excerpts.push({
+      file,
+      line: start + 1,
+      excerpt:
+        snippet.length > MAX_SOURCE_EXCERPT_CHARS_PER_FILE
+          ? snippet.slice(0, MAX_SOURCE_EXCERPT_CHARS_PER_FILE)
+          : snippet,
+    });
   }
   return excerpts;
 }
 
 /** Hard cap on the source evidence embedded in a prompt (chars, whole prompt). */
 export const MAX_SOURCE_EXCERPT_CHARS = 24_000;
+
+/**
+ * Per-file cap on one source excerpt (chars). An over-long excerpt is
+ * truncated to this bound — never dropped: for areas without a keyword table
+ * the excerpt spans the whole file, so dropping the file was silently
+ * discarding its evidence from the prompt.
+ */
+export const MAX_SOURCE_EXCERPT_CHARS_PER_FILE = 1200;
+
+/**
+ * Default per-area prompt/context budget (chars): the hard bound on one
+ * discovery area's submitted prompt — protocol instructions + focus + source
+ * evidence + repository manifest, all of it.
+ *
+ * Rationale: the reasoning model re-reads the whole prompt on every agent
+ * round, and unbounded prompt growth (long paths, wide manifests) shows up
+ * as latency and context-related failures rather than as a clear diagnostic.
+ * This is an explicit, testable bound on what ONE area may submit — not a
+ * claim about the model's context window, and never a reason to silently
+ * drop evidence: over-budget prompts are fitted (manifest only, with an
+ * explicit note) or failed loudly before submission (see
+ * DiscoveryOptions.promptBudgetChars).
+ */
+export const MAX_AREA_PROMPT_CHARS = 64_000;
 
 /**
  * Renders the selected evidence into the prompt as a bounded block.
@@ -508,7 +577,10 @@ function sortFilesForManifest(a: string, b: string): number {
 // Eclipse's `bin` (compiled .class output), Maven/Gradle `target` and the other
 // generated directories are pure noise for a source manifest: on the diakosys repo
 // they were 143 of 220 manifest entries, crowding real sources out of the cap.
-const SKIP_DIRS = new Set([".git", "bin", "target", "build", ".gradle", "node_modules", "dist", ".idea", ".settings", "orchestrator"]);
+// Exported so the auditor's tests-area coverage scan can exclude the same
+// generated/dependency directories — coverage evidence must come from the
+// project's own tests, not from vendored content.
+export const SKIP_DIRS = new Set([".git", "bin", "target", "build", ".gradle", "node_modules", "dist", ".idea", ".settings", "orchestrator"]);
 
 /** Walks a root, honouring SKIP_DIRS and the 4000-entry walk cap (shared `out`). */
 function walk(dir: string, repoDir: string, out: string[], skipped: { count: number }): void {
@@ -525,7 +597,21 @@ function walk(dir: string, repoDir: string, out: string[], skipped: { count: num
     if (entry.isDirectory()) {
       walk(abs, repoDir, out, skipped);
     } else if (out.length < 4000) {
-      out.push(rel);
+      // Only entries that resolve to regular files enter the manifest. A
+      // symlinked directory used to be pushed as a plain file (readdir's
+      // dirent reports the link itself, not the target), and the excerpt read
+      // of it later threw EISDIR — aborting the entire run. statSync resolves
+      // the link's target: a symlink to a file is kept, a symlink to a
+      // directory (or a FIFO/socket, or a vanished/broken link) is skipped,
+      // never fatal.
+      let stat: fs.Stats | undefined;
+      try {
+        stat = fs.statSync(abs);
+      } catch {
+        stat = undefined; // broken symlink or vanished entry: skip, keep walking
+      }
+      if (stat !== undefined && stat.isFile()) out.push(rel);
+      else skipped.count += 1;
     } else {
       skipped.count += 1;
     }
@@ -588,14 +674,59 @@ export function areaInstruction(area: DiscoveryArea, maxProposals: number, manif
 }
 
 /**
+ * Fit an area's manifest (its path-per-line listing) into the per-area prompt
+ * budget when the fully assembled prompt would exceed it.
+ *
+ * Only the manifest is shortened: the protocol instruction and the source
+ * evidence block — the evidence a proposal must be traceable to — are never
+ * trimmed. The shortening is EXPLICIT: the kept listing ends with a note
+ * naming how many of how many paths are shown, so a fitted manifest can
+ * never be mistaken for the full listing.
+ *
+ * Returns null when even an empty manifest plus the note cannot fit the
+ * budget (instruction + evidence alone are over budget); the caller must
+ * then fail the area with a context error BEFORE submitting anything —
+ * never silently truncate instruction or evidence to force a fit.
+ *
+ * Greedy whole-line selection keeps every retained path verbatim and in the
+ * area's ranking order (the highest-ranked paths survive first).
+ */
+export function fitManifestToBudget(
+  area: DiscoveryArea,
+  maxProposals: number,
+  files: string[],
+  evidenceBlock: string | undefined,
+  budgetChars: number,
+): { manifest: string; kept: number } | null {
+  // prompt length with an empty manifest — the fixed (untrimmed) part
+  const fixed = areaInstruction(area, maxProposals, "", evidenceBlock).length;
+  const noteFor = (kept: number): string =>
+    `[manifest trimmed to fit the ${budgetChars}-char per-area prompt budget: showing ${kept} of ${files.length} paths]`;
+  let kept = 0;
+  let used = 0;
+  for (const file of files) {
+    const next = used === 0 ? file.length : used + 1 + file.length; // "\n"-joined
+    // reserve the line AND the final note (computed with the post-add count
+    // so digit rollover, e.g. 9 → 10, cannot overshoot the budget)
+    if (fixed + next + 1 + noteFor(kept + 1).length > budgetChars) break;
+    used = next;
+    kept += 1;
+  }
+  if (kept === 0 && fixed + 1 + noteFor(0).length > budgetChars) return null;
+  const note = noteFor(kept);
+  const manifest = kept === 0 ? note : `${files.slice(0, kept).join("\n")}\n${note}`;
+  return { manifest, kept };
+}
+
+/**
  * Bound on the orphan-turn interrupt wait after a failed area prompt.
  *
  * A failed prompt leaves its turn running server-side (v2 admits the input and
- * executes asynchronously), and every area shares one session — so the next
- * area's prompt must not be admitted before the interrupt has landed. The
- * wait is bounded so an unresponsive server cannot stall the error path:
- * when the grace elapses the run continues and the (dangling) abort result
- * is discarded by the caller regardless.
+ * executes asynchronously) in this area's own session — so the area's session
+ * is interrupted before the area returns, and the wait is bounded so an
+ * unresponsive server cannot stall the error path: when the grace elapses the
+ * run continues and the (dangling) abort result is discarded by the caller
+ * regardless.
  */
 const DISCOVERY_ABORT_GRACE_MS = 2_000;
 
@@ -688,7 +819,20 @@ export class DiscoveryEngine {
     const allRejected: RejectedProposal[] = [];
     const areaResults: AreaResult[] = [];
 
+    // Cancellation gate: the caller's shouldStop() is consulted before each
+    // area starts. Once it signals (e.g. the coordinator lock was lost), no
+    // further area is started — pending work stops here, safely, between
+    // areas rather than mid-prompt.
+    let stopped = false;
     for (const [index, area] of areas.entries()) {
+      if (this.options.shouldStop?.() === true) {
+        stopped = true;
+        this.lifecycle("WARN", "run", "stopped", {
+          detail: `cancelled before area '${area.key}' (${index + 1}/${areas.length}) — remaining areas were not started`,
+          areasStarted: areaResults.length,
+        });
+        break;
+      }
       this.options.onAreaStart?.(area.key, index + 1, areas.length);
       const result = await this.runArea(area, areas.length);
       areaResults.push(result);
@@ -722,9 +866,18 @@ export class DiscoveryEngine {
       evidence: { areas: [], missingFiles: [] },
     };
     result.evidence = collectEvidence(result, this.options.repoDir);
-    // a dry run must not touch persistent state: the CLI reports "nothing
-    // was persisted" for dry runs
-    result.persisted = this.options.dryRun === true
+    // Re-check the cancellation gate right before writing: the lock may have
+    // been lost during the LAST area, after the loop's own check, and a
+    // cancelled run must never persist. A dry run must not touch persistent
+    // state either (the CLI reports the operational writes it does make).
+    if (!stopped && this.options.shouldStop?.() === true) {
+      stopped = true;
+      this.lifecycle("WARN", "run", "stopped", {
+        detail: "cancelled after the last area — the run manifest was not written",
+        areasStarted: areaResults.length,
+      });
+    }
+    result.persisted = this.options.dryRun === true || stopped
       ? false
       : await this.persist(result, this.options.cacheDir ?? defaultCacheDir());
     this.lifecycle("INFO", "run", "completed", {
@@ -774,13 +927,112 @@ export class DiscoveryEngine {
     // model: the model receives pre-extracted source excerpts, so every
     // repository fact in a proposal is traceable to a file this run actually
     // read.
-    // Per-area manifest cap: a targeted area's own limit wins, then the
-    // engine-level limit, then the generic 220.
-    const files = selectFilesForArea(this.options.repoDir, area, area.manifestLimit ?? this.options.manifestLimit ?? 220);
-    const excerpts = extractSourceEvidence(this.options.repoDir, area, files);
-    const evidenceBlock = excerpts.length === 0 ? undefined : renderSourceEvidenceBlock(excerpts);
-    const prompt = areaInstruction(area, this.options.maxProposalsPerArea, files.join("\n"), evidenceBlock);
-    this.lifecycle("INFO", "model-request", "pending", { areaId: area.key, total });
+    // Evidence preparation sits inside the same per-area failure isolation as
+    // the model prompt: a filesystem failure here (an unreadable or unusual
+    // repository entry the walk/extract guards cannot absorb) fails THIS area
+    // — reported on the lifecycle channel and reflected in the area result
+    // and the exit code — and never aborts the remaining areas or the run.
+    let prompt: string;
+    let files: string[] = [];
+    let evidenceBlock: string | undefined;
+    try {
+      // Per-area manifest cap: a targeted area's own limit wins, then the
+      // engine-level limit, then the generic 220.
+      files = selectFilesForArea(this.options.repoDir, area, area.manifestLimit ?? this.options.manifestLimit ?? 220);
+      const excerpts = extractSourceEvidence(this.options.repoDir, area, files);
+      evidenceBlock = excerpts.length === 0 ? undefined : renderSourceEvidenceBlock(excerpts);
+      prompt = areaInstruction(area, this.options.maxProposalsPerArea, files.join("\n"), evidenceBlock);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.lifecycle("ERROR", "evidence", "error", { areaId: area.key, error: message });
+      this.lifecycle("INFO", "area", "completed", {
+        areaId: area.key,
+        status: "error",
+        proposals: 0,
+        rejected: 0,
+        durationMs: Date.now() - areaStartedAt,
+      });
+      return {
+        area: area.key,
+        status: "error",
+        error: message,
+        proposals: [],
+        rejected: [],
+        evidence: [],
+      };
+    }
+    // Context budget: measured BEFORE submission, so an oversized prompt fails
+    // the area instead of being rejected by the model (or silently truncated).
+    // Only the manifest is ever shortened — with an explicit note — because the
+    // instruction and the evidence block are the task context itself; if they
+    // alone are over budget the area fails loudly with nothing submitted.
+    const budgetChars = this.options.promptBudgetChars ?? MAX_AREA_PROMPT_CHARS;
+    const overBudget = (message: string): AreaResult => {
+      this.lifecycle("ERROR", "context", "budget-exceeded", {
+        areaId: area.key,
+        promptChars: prompt.length,
+        budgetChars,
+        error: message,
+      });
+      this.lifecycle("INFO", "area", "completed", {
+        areaId: area.key,
+        status: "error",
+        proposals: 0,
+        rejected: 0,
+        durationMs: Date.now() - areaStartedAt,
+      });
+      return { area: area.key, status: "error", error: message, proposals: [], rejected: [], evidence: [] };
+    };
+    if (prompt.length > budgetChars) {
+      const fitted = fitManifestToBudget(area, this.options.maxProposalsPerArea, files, evidenceBlock, budgetChars);
+      if (fitted === null) {
+        return overBudget(
+          `context budget exceeded for area ${area.key}: prompt ${prompt.length} chars > budget ${budgetChars} chars ` +
+            `(instruction + evidence alone do not fit); no request submitted`,
+        );
+      }
+      this.lifecycle("WARN", "prompt", "manifest-trimmed", {
+        areaId: area.key,
+        kept: fitted.kept,
+        total: files.length,
+        budgetChars,
+      });
+      prompt = areaInstruction(area, this.options.maxProposalsPerArea, fitted.manifest, evidenceBlock);
+      if (prompt.length > budgetChars) {
+        return overBudget(
+          `context budget exceeded for area ${area.key}: prompt ${prompt.length} chars > budget ${budgetChars} chars ` +
+            `(manifest could not be fitted); no request submitted`,
+        );
+      }
+    }
+    // One area = one session: every area starts a fresh OpenCode session so
+    // context never accumulates across areas — a shared session grows until a
+    // long run dies with "context length exceeded" mid-flight, and an area's
+    // errors and logs name its own session.
+    let sessionId: string | undefined;
+    try {
+      sessionId = await this.adapter.beginSession?.();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.lifecycle("ERROR", "session", "error", { areaId: area.key, error: message });
+      this.lifecycle("INFO", "area", "completed", {
+        areaId: area.key,
+        status: "error",
+        proposals: 0,
+        rejected: 0,
+        durationMs: Date.now() - areaStartedAt,
+      });
+      return {
+        area: area.key,
+        status: "error",
+        error: message,
+        proposals: [],
+        rejected: [],
+        evidence: [],
+        sessionId,
+      };
+    }
+    this.lifecycle("INFO", "model-request", "pending", { areaId: area.key, total, sessionId });
     let response: OpenCodePromptResult;
     try {
       response = await this.adapter.prompt({
@@ -799,19 +1051,20 @@ export class DiscoveryEngine {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // The failed prompt's turn may still be executing server-side. Interrupt
-      // the active session BEFORE this area returns, so the next area's prompt
-      // is never admitted into a still-busy shared session. The wait is
-      // bounded (DISCOVERY_ABORT_GRACE_MS) so an unresponsive server cannot
-      // stall the error path, and an abort failure is swallowed so it can
-      // never replace `message`. The adapter contract reports a completed
-      // no-op for an already-idle session (an `interrupted: false` response
-      // body) — that is a success, not an error, and the response is
-      // discarded by design.
-      const sessionId = this.adapter.activeSessionId();
-      if (sessionId !== undefined) {
+      // this area's session BEFORE it returns, so a dangling turn cannot keep
+      // burning model rounds or hold the session busy. The wait is bounded
+      // (DISCOVERY_ABORT_GRACE_MS) so an unresponsive server cannot stall the
+      // error path, and an abort failure is swallowed so it can never replace
+      // `message`. The adapter contract reports a completed no-op for an
+      // already-idle session (an `interrupted: false` response body) — that is
+      // a success, not an error, and the response is discarded by design.
+      // The target is this area's own session, falling back to whatever
+      // session the adapter reports active (adapters without beginSession).
+      const abortTarget = sessionId ?? this.adapter.activeSessionId();
+      if (abortTarget !== undefined) {
         let clearGrace: () => void = () => {};
         await Promise.race([
-          this.adapter.abort(sessionId).catch(() => undefined),
+          this.adapter.abort(abortTarget).catch(() => undefined),
           new Promise<void>((resolve) => {
             const timer = setTimeout(resolve, DISCOVERY_ABORT_GRACE_MS);
             clearGrace = () => {
@@ -837,6 +1090,7 @@ export class DiscoveryEngine {
         proposals: [],
         rejected: [],
         evidence: [],
+        sessionId,
       };
     }
     this.emitTurnStats(response.turnStats, area.key);
@@ -913,7 +1167,14 @@ export class DiscoveryEngine {
       rejected: rejected.length,
       durationMs: Date.now() - areaStartedAt,
     });
-    return { area: area.key, status: "ok", proposals: accepted, rejected, evidence: accepted.flatMap((p) => p.evidence) };
+    return {
+      area: area.key,
+      status: "ok",
+      proposals: accepted,
+      rejected,
+      evidence: accepted.flatMap((p) => p.evidence),
+      sessionId,
+    };
   }
 }
 

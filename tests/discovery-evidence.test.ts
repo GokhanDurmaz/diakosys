@@ -7,6 +7,7 @@ import { MockOpenCodeAdapter } from "../src/opencode.ts";
 import {
   DISCOVERY_AREAS,
   DiscoveryEngine,
+  MAX_SOURCE_EXCERPT_CHARS_PER_FILE,
   areaInstruction,
   extractSourceEvidence,
   repoManifest,
@@ -215,3 +216,63 @@ test("areaInstruction renders the optional evidence block before the manifest se
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ——— per-file excerpt cap: truncate, never drop ———
+// For an area without a keyword table the excerpt spans the whole file, so the
+// old drop-over-cap behaviour silently discarded every realistic source file's
+// evidence from the prompt (files over 1200 chars were skipped entirely).
+
+test("an over-long excerpt is truncated, not dropped: the file still contributes evidence", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-dis-ev-cap-"));
+  fs.mkdirSync(path.join(dir, "src/main/java/io/diakosys"), { recursive: true });
+  try {
+    // single-line files: for a non-keyword area the excerpt is the whole
+    // (non-empty) content, so the content length is the excerpt length
+    const below = "src/main/java/io/diakosys/Small.java";
+    const at = "src/main/java/io/diakosys/Exact.java";
+    const above = "src/main/java/io/diakosys/Large.java";
+    const belowBody = "s".repeat(MAX_SOURCE_EXCERPT_CHARS_PER_FILE - 100);
+    const atBody = "e".repeat(MAX_SOURCE_EXCERPT_CHARS_PER_FILE);
+    const aboveBody = "l".repeat(MAX_SOURCE_EXCERPT_CHARS_PER_FILE + 400);
+    fs.writeFileSync(path.join(dir, below), belowBody);
+    fs.writeFileSync(path.join(dir, at), atBody);
+    fs.writeFileSync(path.join(dir, above), aboveBody);
+
+    const excerpts = extractSourceEvidence(dir, area("architecture"), [below, at, above]);
+    assert.equal(excerpts.length, 3, "a file over the cap must still contribute an excerpt");
+    const byFile = new Map(excerpts.map((e) => [e.file, e]));
+    assert.equal(byFile.get(below)!.excerpt, belowBody, "below the cap the excerpt is the verbatim whole file");
+    assert.equal(byFile.get(at)!.excerpt, atBody, "a file exactly at the cap is kept whole");
+    assert.equal(byFile.get(above)!.excerpt, aboveBody.slice(0, MAX_SOURCE_EXCERPT_CHARS_PER_FILE), "a file over the cap contributes a verbatim prefix truncated to the cap");
+    assert.equal(byFile.get(above)!.excerpt.length, MAX_SOURCE_EXCERPT_CHARS_PER_FILE, "the over-cap excerpt is bounded");
+    assert.ok(byFile.get(above)!.excerpt.length > 0, "the over-cap excerpt is non-empty");
+    assert.equal(byFile.get(above)!.line, 1, "the excerpt line is the file's real first line");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ——— unreadable files must never abort the area or the run ———
+// An entry that passes existsSync but cannot be read (permissions changed
+// between the walk and the excerpt read) used to throw out of
+// extractSourceEvidence with no catch between there and the run loop.
+
+test("an unreadable file is skipped by extractSourceEvidence; other files still excerpt", { skip: process.platform === "win32" ? "POSIX file permissions only" : false }, () => {
+  const dir = tmpRepo();
+  try {
+    const readable = "src/main/java/io/diakosys/HealthEvaluator.java";
+    const unreadable = "src/main/java/io/diakosys/Locked.java";
+    fs.writeFileSync(path.join(dir, unreadable), "class Locked {}");
+    fs.chmodSync(path.join(dir, unreadable), 0o000);
+    try {
+      const excerpts = extractSourceEvidence(dir, area("architecture"), [unreadable, readable]);
+      assert.deepEqual(excerpts.map((e) => e.file), [readable], "the unreadable file contributes nothing; the readable file is still excerpted");
+      assert.equal(excerpts[0]!.file, readable);
+    } finally {
+      fs.chmodSync(path.join(dir, unreadable), 0o644);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+

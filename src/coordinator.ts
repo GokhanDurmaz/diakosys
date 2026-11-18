@@ -1,5 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { withWriteTx } from "./tx.ts";
+import { now } from "./clock.ts";
 import {
   acquireLockTxn,
   coordinatorGuardTxn,
@@ -43,6 +44,26 @@ export function renewInstanceLock(db: DatabaseSync, authority: CoordinatorAuthor
   } catch {
     return false;
   }
+}
+
+/**
+ * Read-only ownership probe: true only while `authority` still owns the row
+ * (same owner AND generation) and its lease has not expired.
+ *
+ * Deliberately non-writing (no transaction, no renewal) so a caller can
+ * re-check ownership immediately before a write without extending the lease
+ * as a side effect. The predicate mirrors coordinatorGuardTxn's WHERE clause
+ * exactly: a lock that would fail the guard must also read as not held here,
+ * or a stale writer could pass this check and then be disowned mid-write.
+ */
+export function holdsInstanceLock(db: DatabaseSync, authority: CoordinatorAuthority): boolean {
+  const row = readLockRow(db);
+  return (
+    row !== undefined &&
+    row.owner === authority.owner &&
+    row.generation === authority.generation &&
+    row.expiresAt > now()
+  );
 }
 
 /** Release the lock if still held; wrapped in its own transaction. */
