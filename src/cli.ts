@@ -81,11 +81,12 @@ function acquireCoordinator(db: ReturnType<typeof openDatabase>, config: Orchest
  * Opt-in real-time lifecycle observer for CLI commands.
  *
  * One logger per command invocation; its sink is stdout (one line per event).
- * Returns `undefined` when `--lifecycle` is absent, so the scripted output
- * contract (exact stdout) is untouched by default.
+ * It is opt-in via `--lifecycle` (the existing per-command flag) or `--verbose`
+ * (the detailed stage-log option), so the scripted output contract (exact
+ * stdout) is untouched by default.
  */
 function lifecycleLoggerFor(args: string[]): LifecycleLogger | undefined {
-  if (!args.includes("--lifecycle")) return undefined;
+  if (!args.includes("--lifecycle") && !args.includes("--verbose")) return undefined;
   return new LifecycleLogger({
     sink: (line) => process.stdout.write(`${line}\n`),
   });
@@ -210,8 +211,10 @@ function usage(code: number): void {
       "  run [--mock] [--max <n>]    Execute up to n queued tasks (default 1); --mock uses a test adapter",
       "",
       "Discovery and planning (read-only analysis, no auto-execution):",
-      "  discover [--dry-run] [--area a,b,...]",
+      "  discover [--dry-run] [--area a,b,...] [--lifecycle] [--verbose]",
       "                              Inspect the repo with the configured model in read-only mode",
+      "                              --lifecycle/--verbose print the lifecycle and 13-stage",
+      "                              pipeline events; both are opt-in, stdout is unchanged by default",
       "  plan                        Validate discovered proposals; queue dependency-ready ones",
       "                              Takes no arguments: any --flag is rejected before the database opens",
       "  cycle [--mock] [--max-executions <n>] [--max-rounds <n>] [--no-discovery]",

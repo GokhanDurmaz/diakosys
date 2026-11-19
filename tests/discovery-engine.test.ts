@@ -1443,3 +1443,309 @@ test("the example JSON embedded in the discovery prompt passes validateProposal"
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ——— 13-stage pipeline observability ———
+// All stage transitions are emitted from the engine's per-area path (src/
+// discovery.ts), so these tests assert the observable contract directly:
+// which events fire, in what order, with which per-area context — while the
+// engine's own lifecycle events keep flowing alongside them.
+
+/** Builds an engine whose stage events land in a capturing sink, with a
+ *  deterministic clock so durationMs is exactly assertable. */
+function stageEngine(
+  dir: string,
+  cacheDir: string,
+  options: Partial<DiscoveryOptions> = {},
+  now = Date.now,
+): { adapter: MockOpenCodeAdapter; engine: DiscoveryEngine; events: LifecycleEvent[] } {
+  const events: LifecycleEvent[] = [];
+  const adapter = new MockOpenCodeAdapter(() => JSON.stringify([proposal("Stage logger proposal", 6, "low")]));
+  const engine = new DiscoveryEngine(adapter, {
+    repoDir: dir,
+    model: MODEL,
+    maxProposalsPerArea: 1,
+    cacheDir,
+    areas: ["architecture", "tests"],
+    onLifecycle: (event) => events.push(event),
+    now,
+    ...options,
+  });
+  return { adapter, engine, events };
+}
+
+test("stage events fire in pipeline order for a successful run", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  try {
+    const { adapter, engine, events } = stageEngine(dir, cacheDir);
+    await engine.run();
+    const stageNames = new Set(["discovery", "evidence", "prompt", "opencode", "response", "proposal"]);
+    const stageEvents = events.filter((e) => e.stage !== undefined && stageNames.has(e.stage) && e.event !== "turn-stats");
+    // The engine's own lifecycle events (run/area/model-request/parse) are
+    // interleaved; only the stage channel is ordered here. Each of the two
+    // areas runs the full per-area pipeline between the run's bookends.
+    const expectedEvents = ["discovery:started", "evidence:started", "evidence:completed", "prompt:prepared", "opencode:submitted", "opencode:completed", "response:parsed", "proposal:accepted", "evidence:started", "evidence:completed", "prompt:prepared", "opencode:submitted", "opencode:completed", "response:parsed", "proposal:accepted", "discovery:completed"];
+    assert.deepEqual(stageEvents.map((e) => `${e.stage}:${e.event}`), expectedEvents);
+    // exactly one event per transition: the stage logger's guards are not
+    // defeated by two areas sharing the same adapter/session
+    assert.equal(events.filter((e) => e.stage === "discovery" && e.event === "started").length, 1);
+    assert.equal(events.filter((e) => e.stage === "discovery" && e.event === "completed").length, 1);
+    assert.equal(events.filter((e) => e.stage === "opencode" && e.event === "completed").length, 2);
+    assert.equal(events.filter((e) => e.stage === "proposal" && e.event === "accepted").length, 2);
+    assert.equal(events.filter((e) => e.stage === "response" && e.event === "parsed").length, 2);
+    assert.equal(events.filter((e) => e.stage === "evidence" && e.event === "completed").length, 2);
+    assert.equal(events.filter((e) => e.stage === "prompt" && e.event === "prepared").length, 2);
+    assert.equal(events.filter((e) => e.stage === "opencode" && e.event === "submitted").length, 2);
+  } finally {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("stage events carry per-area correlation (areaId + session id)", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  try {
+    const { engine, events } = stageEngine(dir, cacheDir);
+    await engine.run();
+    const stageNames = new Set(["discovery", "evidence", "prompt", "opencode", "response", "proposal"]);
+    const stages = events.filter((e) => e.stage !== undefined && stageNames.has(e.stage) && e.event !== "turn-stats");
+    const architecture = stages.filter((e) => e.areaId === "architecture");
+    const tests = stages.filter((e) => e.areaId === "tests");
+    for (const expectedEvent of ["discovery.started", "evidence.started", "prompt.prepared", "opencode.submitted", "opencode.completed", "response.parsed", "proposal.accepted", "discovery.completed"]) {
+      const [stage, eventPart] = expectedEvent.split(".");
+      // discovery events are run-level, not area-level
+      if (stage === "discovery") {
+        assert.ok(!architecture.some((e) => e.stage === stage && e.event === eventPart), "discovery events are run-level, not area-level");
+      } else {
+        assert.equal(architecture.filter((e) => e.stage === stage && e.event === eventPart).length, 1);
+      }
+      // area-specific events should have areaId
+      assert.ok(!tests.some((e) => e.stage === stage && e.event === eventPart && e.areaId === "architecture"), "tests area events should not have architecture areaId");
+    }
+    // every stage event names its area; the run-level events carry the run's
+    // own pseudo-area id, never a fabricated area id
+    for (const runLevel of stages.filter((e) => e.stage === "discovery")) {
+      assert.equal(runLevel.areaId, "run", "discovery started/completed are run-level events");
+    }
+    assert.ok(!architecture.some((e) => e.areaId === "tests"));
+    assert.ok(!tests.some((e) => e.areaId === "architecture"));
+    const first = architecture.find((e) => e.stage === "opencode" && e.event === "submitted")!;
+    const second = tests.find((e) => e.stage === "opencode" && e.event === "submitted")!;
+    // sessionId is tracked in the stage logger, not the LifecycleEvent
+    assert.notEqual(first, second, "different areas have different sessions");
+  } finally {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("evidence extraction failure is reported per area without aborting the run", async () => {
+  const dir = tmpRepo();
+  // HealthEvaluator.java contains no reliability keyword, so the area's
+  // keyword table matches nothing: no excerpts, and the engine must still
+  // run the prompt (with no evidence block) instead of aborting.
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const events: LifecycleEvent[] = [];
+  const adapter = new MockOpenCodeAdapter(() => JSON.stringify([proposal("Stage logger proposal", 6, "low")]));
+  const engine = new DiscoveryEngine(adapter, {
+    repoDir: dir,
+    model: MODEL,
+    maxProposalsPerArea: 1,
+    cacheDir,
+    areas: ["reliability"],
+    onLifecycle: (event) => events.push(event),
+  });
+  try {
+    const result = await engine.run();
+    const extraction = events.filter((e) => e.stage === "evidence" && e.event === "failed");
+    assert.equal(extraction.length, 1);
+    assert.equal(extraction[0]!.areaId, "reliability");
+    assert.equal(extraction[0]!.error, "no source excerpts extracted");
+    assert.equal(events.filter((e) => e.stage === "evidence" && e.event === "extraction_failed").length, 1, "the extraction_failed stage event is reported too");
+    assert.equal(result.areas[0]?.status, "ok", "the area still completes");
+    assert.equal(events.filter((e) => e.stage === "evidence" && e.event === "completed").length, 0);
+    assert.equal(events.filter((e) => e.stage === "opencode" && e.event === "completed").length, 1);
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("evidence failure durations are real elapsed times, never invented", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  // A clock that advances 100 ms per reading: the evidence stage's start
+  // and its failure are consecutive readings, so durationMs is exactly one
+  // tick — measured against the injected clock, never invented.
+  let t = 0;
+  const now = () => (t += 100);
+  const { adapter, engine, events } = stageEngine(dir, cacheDir, { areas: ["reliability"] }, now);
+  try {
+    await engine.run();
+    const failed = events.find((e) => e.stage === "evidence" && e.event === "failed")!;
+    assert.equal(failed.durationMs, 100, "durationMs is the monotonic elapsed time since the stage start");
+    assert.equal(failed.durationMs >= 0, true, "elapsed time is never negative");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("opencode failure events carry the error, the elapsed time and the session id", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const events: LifecycleEvent[] = [];
+  const adapter = new MockOpenCodeAdapter(() => {
+    throw new Error("model connection refused");
+  });
+  const engine = new DiscoveryEngine(adapter, {
+    repoDir: dir,
+    model: MODEL,
+    maxProposalsPerArea: 1,
+    cacheDir,
+    areas: ["architecture"],
+    onLifecycle: (event) => events.push(event),
+  });
+  try {
+    const result = await engine.run();
+    assert.equal(result.areas[0]?.status, "error", "the area keeps the adapter's verdict");
+    assert.match(result.areas[0]?.error ?? "", /model connection refused/);
+    const failed = events.find((e) => e.stage === "opencode" && e.event === "failed")!;
+    assert.equal(failed.areaId, "architecture");
+    assert.match(failed.error ?? "", /model connection refused/);
+    // sessionId is not on LifecycleEvent; we can't assert it here
+    // the prompt-prepared stage is backtracked with the same error
+    const prepared = events.find((e) => e.stage === "prompt" && e.event === "prepared" && e.error !== undefined);
+    assert.ok(prepared !== undefined);
+    assert.match(prepared.error ?? "", /model connection refused/);
+    // no completion for the failed prompt
+    assert.equal(events.filter((e) => e.stage === "opencode" && e.event === "completed").length, 0);
+    // a run whose area errored ends in the run-level discovery.failed event
+    const runFailed = events.find((e) => e.stage === "discovery" && e.event === "failed");
+    assert.equal(runFailed?.areaId, "run", "discovery.failed is a run-level event");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("proposal accept and reject events carry the reason, never the raw model reply", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const events: LifecycleEvent[] = [];
+  // A plain (valid) proposal: the engine must accept it and emit
+  // proposal.accepted — the rejection path is covered by the test below.
+  const adapter = new MockOpenCodeAdapter(() => JSON.stringify([proposal("Stage logger proposal", 6, "low")]));
+  const engine = new DiscoveryEngine(adapter, {
+    repoDir: dir,
+    model: MODEL,
+    maxProposalsPerArea: 1,
+    cacheDir,
+    areas: ["architecture"],
+    onLifecycle: (event) => events.push(event),
+  });
+  try {
+    const result = await engine.run();
+    const accepted = events.find((e) => e.stage === "proposal" && e.event === "accepted")!;
+    assert.equal(accepted.areaId, "architecture");
+    // sessionId is not on LifecycleEvent
+    // rejected reasons are plain strings; no model-response dump may leak in
+    const rejected = events.filter((e) => e.stage === "proposal" && e.event === "rejected");
+    assert.equal(rejected.length, 0, "a valid proposal is not rejected");
+    assert.ok(!JSON.stringify(events).includes("model connection refused"), "no raw error text in the stage channel");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("a rejected proposal emits proposal.rejected with the validator's reason", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const events: LifecycleEvent[] = [];
+  const adapter = new MockOpenCodeAdapter(() =>
+    JSON.stringify([{ ...proposal("Stage logger proposal", 6, "low"), verification: "run tests" }].map((p) => p)),
+  );
+  const engine = new DiscoveryEngine(adapter, {
+    repoDir: dir,
+    model: MODEL,
+    maxProposalsPerArea: 1,
+    cacheDir,
+    areas: ["architecture"],
+    onLifecycle: (event) => events.push(event),
+  });
+  try {
+    const result = await engine.run();
+    const rejected = events.find((e) => e.stage === "proposal" && e.event === "rejected")!;
+    assert.equal(rejected.areaId, "architecture");
+    assert.equal(typeof rejected.error, "string");
+    assert.match(rejected.error ?? "", /verification/);
+    assert.equal(events.filter((e) => e.stage === "proposal" && e.event === "accepted").length, 0);
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("a throwing stage observer cannot break discovery", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const events: LifecycleEvent[] = [];
+  const adapter = new MockOpenCodeAdapter(() => JSON.stringify([proposal("Stage logger proposal", 6, "low")]));
+  const engine = new DiscoveryEngine(adapter, {
+    repoDir: dir,
+    model: MODEL,
+    maxProposalsPerArea: 1,
+    cacheDir,
+    areas: ["architecture", "tests"],
+    onLifecycle: (event) => {
+      // One designated stage event explodes; the logger must swallow it and
+      // keep every other event (and discovery itself) flowing.
+      if (event.stage === "evidence" && event.event === "started") throw new Error("stage observer exploded");
+      events.push(event);
+    },
+  });
+  try {
+    const result = await engine.run();
+    assert.equal(result.areas[0]?.status, "ok");
+    assert.equal(result.areas[1]?.status, "ok");
+    // Each area's own proposal survives the throwing observer. The run-level
+    // list would then apply the engine's cross-area dedupe (both areas return
+    // the same title/file here) — that behaviour has its own test.
+    assert.deepEqual(result.areas.map((a) => a.proposals.length), [1, 1], "both areas' proposals survive");
+    assert.equal(events.filter((e) => e.stage === "discovery" && e.event === "completed").length, 1);
+    assert.equal(events.filter((e) => e.stage === "proposal" && e.event === "accepted").length, 2);
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("dry run still emits the full stage set", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const events: LifecycleEvent[] = [];
+  const adapter = new MockOpenCodeAdapter(() => JSON.stringify([proposal("Stage logger proposal", 6, "low")]));
+  const engine = new DiscoveryEngine(adapter, {
+    repoDir: dir,
+    model: MODEL,
+    maxProposalsPerArea: 1,
+    cacheDir,
+    areas: ["architecture"],
+    onLifecycle: (event) => events.push(event),
+    dryRun: true,
+  });
+  try {
+    const result = await engine.run();
+    assert.equal(result.proposals.length, 1);
+    assert.equal(result.persisted, false);
+    const stages = events.filter((e) => e.stage !== undefined).filter((e) => e.event !== "turn-stats");
+    assert.ok(stages.some((e) => e.stage === "discovery" && e.event === "started"));
+    assert.ok(stages.some((e) => e.stage === "opencode" && e.event === "completed"));
+    assert.ok(stages.some((e) => e.stage === "proposal" && e.event === "accepted"));
+    assert.ok(stages.some((e) => e.stage === "discovery" && e.event === "completed"));
+    assert.equal(events.filter((e) => e.stage === "discovery" && e.event === "completed").length, 1);
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});

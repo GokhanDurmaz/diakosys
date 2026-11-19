@@ -14,6 +14,7 @@ import {
   type Proposal,
 } from "./proposal.ts";
 import { DUPLICATE_THRESHOLD } from "./proposal.ts";
+import { StageLogger } from "./stages.ts";
 
 /**
  * The model-facing agent used for discovery.
@@ -234,6 +235,12 @@ export interface DiscoveryOptions {
    * stripped by the logger so they don't echo the line's own columns.
    */
   onLifecycle?: (ev: LifecycleEvent) => void;
+  /**
+   * Injectable clock for the 13 pipeline stage events (tests only; defaults
+   * to Date.now). Stage durations are measured against this clock and never
+   * invented, so a deterministic clock makes them exactly assertable.
+   */
+  now?: () => number;
 }
 
 /** Evidence backing accepted proposals: file + symbol + what was observed. */
@@ -748,10 +755,13 @@ function formatToolCalls(toolCalls: Record<string, number>): string | undefined 
 export class DiscoveryEngine {
   private adapter: OpenCodeAdapter;
   private readonly options: DiscoveryOptions;
+  /** The 13 pipeline stage transitions (observability only). */
+  private stages: StageLogger;
 
   constructor(adapter: OpenCodeAdapter, options: DiscoveryOptions) {
     this.adapter = adapter;
     this.options = options;
+    this.stages = new StageLogger({ onLifecycle: options.onLifecycle, now: options.now ?? Date.now });
   }
 
   /** Directory holding this engine's resumable-run manifest: an explicit
@@ -762,13 +772,17 @@ export class DiscoveryEngine {
 
   /** Emit a lifecycle event to the optional observer; no-op when absent. */
   private lifecycle(level: LifecycleLevel, stage: string, event: string, extra: Record<string, unknown> = {}): void {
-    this.options.onLifecycle?.({
-      level,
-      operation: "discover",
-      stage,
-      event,
-      ...extra,
-    });
+    try {
+      this.options.onLifecycle?.({
+        level,
+        operation: "discover",
+        stage,
+        event,
+        ...extra,
+      });
+    } catch (_err) {
+      // An observing sink that throws must never alter the area result
+    }
   }
 
   /**
@@ -812,6 +826,8 @@ export class DiscoveryEngine {
       areas: selectAreas(this.options.areas).length,
       dryRun: this.options.dryRun === true,
     });
+    this.stages.start("discovery");
+    this.stages.oneShot("discovery", "started", { areaId: "run" });
     const startedAt = Date.now();
     const areas = selectAreas(this.options.areas);
     const allProposals: Proposal[] = [];
@@ -879,6 +895,33 @@ export class DiscoveryEngine {
     result.persisted = this.options.dryRun === true || stopped
       ? false
       : await this.persist(result, this.options.cacheDir ?? defaultCacheDir());
+    // The run's own outcome is the last stage transition: `discovery.failed`
+    // when at least one area errored (the CLI's exit-1 condition), `discovery.completed`
+    // otherwise. A logger that throws can never change the run's outcome —
+    // the event is marked failed and the error still propagates as before.
+    const failedAreas = result.areas.filter(
+      (a): a is AreaResult & { status: "error" } => a.status === "error",
+    );
+    const failed = failedAreas.length > 0;
+    if (failed) {
+      this.stages.failed("discovery", {
+        areaId: "run",
+        areas: areas.length,
+        proposals: result.proposals.length,
+        rejected: result.rejected.length,
+        persisted: result.persisted,
+        durationMs: Date.now() - startedAt,
+      });
+    } else {
+      this.stages.complete("discovery", {
+        areaId: "run",
+        areas: areas.length,
+        proposals: result.proposals.length,
+        rejected: result.rejected.length,
+        persisted: result.persisted,
+        durationMs: Date.now() - startedAt,
+      });
+    }
     this.lifecycle("INFO", "run", "completed", {
       areas: areas.length,
       proposals: result.proposals.length,
@@ -922,6 +965,12 @@ export class DiscoveryEngine {
   private async runArea(area: DiscoveryArea, total: number): Promise<AreaResult> {
     const areaStartedAt = Date.now();
     this.lifecycle("INFO", "area", "started", { areaId: area.key, total });
+    this.stages.start("evidence");
+    this.stages.oneShot("evidence", "started", { areaId: area.key });
+    let sessionId: string | undefined;
+    let prompt: string;
+    let files: string[] = [];
+    let evidenceBlock: string | undefined;
     // Evidence is prepared deterministically by the orchestrator, not by the
     // model: the model receives pre-extracted source excerpts, so every
     // repository fact in a proposal is traceable to a file this run actually
@@ -931,18 +980,40 @@ export class DiscoveryEngine {
     // repository entry the walk/extract guards cannot absorb) fails THIS area
     // — reported on the lifecycle channel and reflected in the area result
     // and the exit code — and never aborts the remaining areas or the run.
-    let prompt: string;
-    let files: string[] = [];
-    let evidenceBlock: string | undefined;
     try {
       // Per-area manifest cap: a targeted area's own limit wins, then the
       // engine-level limit, then the generic 220.
       files = selectFilesForArea(this.options.repoDir, area, area.manifestLimit ?? this.options.manifestLimit ?? 220);
       const excerpts = extractSourceEvidence(this.options.repoDir, area, files);
-      evidenceBlock = excerpts.length === 0 ? undefined : renderSourceEvidenceBlock(excerpts);
+      if (excerpts.length === 0) {
+        // Every candidate file was unreadable or keyword-free: nothing usable
+        // was extracted for this area. The prompt still runs with no evidence
+        // block — that is the existing behaviour — but the area's evidence step
+        // is reported as extraction_failed, so a silent no-evidence run is
+        // observable instead of looking like a clean run.
+        const elapsedMs = this.stages.elapsed("evidence");
+        this.stages.failed("evidence", {
+          areaId: area.key,
+          error: "no source excerpts extracted",
+          durationMs: elapsedMs,
+        });
+        this.lifecycle("ERROR", "evidence", "extraction_failed", {
+          areaId: area.key,
+          reason: "no source excerpts extracted",
+        });
+      } else {
+        evidenceBlock = renderSourceEvidenceBlock(excerpts);
+        this.stages.complete("evidence", { areaId: area.key, sessionId });
+      }
       prompt = areaInstruction(area, this.options.maxProposalsPerArea, files.join("\n"), evidenceBlock);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const elapsedMs = this.stages.elapsed("evidence");
+      this.stages.failed("evidence", {
+        areaId: area.key,
+        error: message,
+        durationMs: elapsedMs,
+      });
       this.lifecycle("ERROR", "evidence", "error", { areaId: area.key, error: message });
       this.lifecycle("INFO", "area", "completed", {
         areaId: area.key,
@@ -1004,15 +1075,24 @@ export class DiscoveryEngine {
         );
       }
     }
+    this.stages.oneShot("prompt", "prepared", { areaId: area.key, sessionId });
+    this.stages.complete("prompt", { areaId: area.key, sessionId });
+    this.stages.start("opencode");
+    this.stages.oneShot("opencode", "submitted", { areaId: area.key });
     // One area = one session: every area starts a fresh OpenCode session so
     // context never accumulates across areas — a shared session grows until a
     // long run dies with "context length exceeded" mid-flight, and an area's
     // errors and logs name its own session.
-    let sessionId: string | undefined;
     try {
       sessionId = await this.adapter.beginSession?.();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const elapsedMs = this.stages.elapsed("opencode");
+      this.stages.failed("opencode", {
+        areaId: area.key,
+        error: message,
+        durationMs: elapsedMs,
+      });
       this.lifecycle("ERROR", "session", "error", { areaId: area.key, error: message });
       this.lifecycle("INFO", "area", "completed", {
         areaId: area.key,
@@ -1074,6 +1154,16 @@ export class DiscoveryEngine {
         ]).finally(() => clearGrace());
       }
       this.emitTurnStats(extractTurnStats(err), area.key);
+      const opencodeElapsedMs = this.stages.elapsed("opencode");
+      this.stages.failed("opencode", {
+        areaId: area.key,
+        error: message,
+        durationMs: opencodeElapsedMs,
+      });
+      // The prompt stage is backtracked with the failure's error: the area
+      // died after its prompt was prepared, so the prompt's fate is visible
+      // on the stage channel alongside opencode.failed.
+      this.stages.oneShot("prompt", "prepared", { areaId: area.key, error: message });
       this.lifecycle("ERROR", "model-request", "error", { areaId: area.key, error: message });
       this.lifecycle("INFO", "area", "completed", {
         areaId: area.key,
@@ -1097,6 +1187,9 @@ export class DiscoveryEngine {
       areaId: area.key,
       durationMs: Date.now() - areaStartedAt,
     });
+    this.stages.complete("opencode", { areaId: area.key, sessionId });
+    this.stages.complete("prompt", { areaId: area.key, sessionId });
+    this.stages.oneShot("response", "parsed", { areaId: area.key, sessionId });
     const { items, parseErrors, segments, truncated } = extractJsonCandidates(response.text);
     const rejected: RejectedProposal[] = parseErrors.map((reason) => ({ area: area.key, reason, raw: reason }));
     // A plausible truncated-JSON tail (the reply was cut off mid-array or
@@ -1153,6 +1246,13 @@ export class DiscoveryEngine {
       accepted.push(validated.proposal);
       if (accepted.length >= this.options.maxProposalsPerArea) break;
     }
+    for (const reason of rejected.map((r) => r.reason)) {
+      this.stages.oneShot("proposal", "rejected", { areaId: area.key, error: reason });
+    }
+    for (const proposal of accepted) {
+      this.stages.oneShot("proposal", "accepted", { areaId: area.key, sessionId });
+    }
+    this.stages.complete("evidence", { areaId: area.key, sessionId });
     this.lifecycle("INFO", "parse", "completed", {
       areaId: area.key,
       accepted: accepted.length,
