@@ -1931,8 +1931,9 @@ test("discover --dry-run --area quality --lifecycle logs the audit-completed eve
     const lifecycleLines = r.stdout.split("\n").filter((l) => l.startsWith("[") && /\] /.test(l));
     // The engine logs its run/area/model-request/parse lifecycle events plus the stage logger events;
     // the audit-completed event is appended last, carrying the final counts.
-    assert.equal(lifecycleLines.length, 17);
-    assert.match(lifecycleLines[lifecycleLines.length - 1] ?? "", /^\[\d\d:\d\d:\d\d\] INFO  discover\s+audit\s+completed accepted=0 rejected=1$/);
+    // Note: run.completed was removed as it appeared before audit ran.
+    assert.equal(lifecycleLines.length, 20);
+    assert.match(lifecycleLines[lifecycleLines.length - 1] ?? "", /^\[\d\d:\d\d:\d\d\] INFO  discover\s+audit\s+completed accepted=0 rejected=1 durationMs=\d+$/);
     assert.equal(lifecycleLines[lifecycleLines.length - 1], lifecycleLines[lifecycleLines.length - 1], "the audit event is the last lifecycle line");
   } finally {
     await stub.close();
@@ -1950,10 +1951,11 @@ test("discover --dry-run --verbose exposes the same detailed lifecycle and stage
     assert.equal(r.stderr, "");
     const lifecycleLines = r.stdout.split("\n").filter((l) => l.startsWith("[") && /\] /.test(l));
     // --verbose is the alias for the same opt-in detailed stream as
-    // --lifecycle: the identical 17 engine + stage lines, audit event last.
-    assert.equal(lifecycleLines.length, 17);
+    // --lifecycle: the identical engine + stage lines, audit event last.
+    // Note: run.completed was removed as it appeared before audit ran.
+    assert.equal(lifecycleLines.length, 20);
     assert.ok(lifecycleLines.some((l) => /discover\s+discovery\s+started/.test(l)), "the 13-stage channel is exposed");
-    assert.match(lifecycleLines[lifecycleLines.length - 1] ?? "", /audit\s+completed accepted=0 rejected=1$/);
+    assert.match(lifecycleLines[lifecycleLines.length - 1] ?? "", /audit\s+completed accepted=0 rejected=1 durationMs=\d+$/);
   } finally {
     await stub.close();
   }

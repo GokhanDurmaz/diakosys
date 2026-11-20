@@ -922,13 +922,6 @@ export class DiscoveryEngine {
         durationMs: Date.now() - startedAt,
       });
     }
-    this.lifecycle("INFO", "run", "completed", {
-      areas: areas.length,
-      proposals: result.proposals.length,
-      rejected: result.rejected.length,
-      persisted: result.persisted,
-      durationMs: Date.now() - startedAt,
-    });
     return result;
   }
 
