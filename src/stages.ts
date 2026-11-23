@@ -21,7 +21,7 @@ import type { LifecycleEvent } from "./lifecycle.ts";
 /** Injectable clock (tests). Same shape as lifecycle.ts's internal `NowFn`. */
 type NowFn = () => number;
 
-/** The 13 pipeline stages, as `stage` → `event` pairs. */
+/** The 15 pipeline stages, as `stage` → `event` pairs. */
 export const STAGE_NAMES: ReadonlyArray<[string, string]> = [
   ["discovery", "started"],
   ["discovery", "completed"],
@@ -36,6 +36,7 @@ export const STAGE_NAMES: ReadonlyArray<[string, string]> = [
   ["response", "parsed"],
   ["proposal", "accepted"],
   ["proposal", "rejected"],
+  ["proposal", "completed"],
 ];
 
 export interface StageLoggerOptions {
@@ -61,15 +62,22 @@ export class StageLogger {
   /** Record a stage start; idempotent for the same stage+area pair. */
   start(stage: string, extra: Record<string, unknown> = {}): void {
     const key = `${stage}:${extra.areaId ?? "run"}`;
-    if (this.startedAt.has(key)) return;
+    console.log(`DEBUG StageLogger.start: stage=${stage}, areaId=${extra.areaId}, key=${key}`);
+    if (this.startedAt.has(key)) {
+      console.log(`DEBUG StageLogger.start: key ${key} already exists, returning early`);
+      return;
+    }
     this.startedAt.set(key, this.now());
+    console.log(`DEBUG StageLogger.start: set startedAt for key ${key}`);
     this.outcome(stage, "started", extra);
   }
 
   /** Elapsed ms since the stage started, or `undefined` if it never started. Does not clear the tracking entry. */
   elapsed(stage: string, extra?: Record<string, unknown>): number | undefined {
     const key = `${stage}:${extra?.areaId ?? "run"}`;
+    console.log(`DEBUG StageLogger.elapsed: stage=${stage}, areaId=${extra?.areaId}, key=${key}`);
     const startedAt = this.startedAt.get(key);
+    console.log(`DEBUG StageLogger.elapsed: startedAt=${startedAt}`);
     // Don't clear the entry - callers may call elapsed() multiple times
     return startedAt === undefined ? undefined : this.now() - startedAt;
   }

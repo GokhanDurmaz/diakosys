@@ -891,36 +891,25 @@ export class DiscoveryEngine {
         areasStarted: areaResults.length,
       });
     }
+
+    // Check if any area failed - emit discovery.failed if so
+    const hasFailedArea = areaResults.some((r) => r.status === "error");
+    if (hasFailedArea) {
+      const firstFailed = areaResults.find((r) => r.status === "error");
+      this.stages.failed("discovery", {
+        areaId: "run",
+        error: firstFailed?.error ?? "area failed",
+      });
+      this.lifecycle("ERROR", "run", "failed", {
+        areaId: "run",
+        error: firstFailed?.error ?? "area failed",
+      });
+    }
+
     result.persisted = this.options.dryRun === true || stopped
       ? false
       : await this.persist(result, this.options.cacheDir ?? defaultCacheDir());
-    // The run's own outcome is the last stage transition: `discovery.failed`
-    // when at least one area errored (the CLI's exit-1 condition), `discovery.completed`
-    // otherwise. A logger that throws can never change the run's outcome —
-    // the event is marked failed and the error still propagates as before.
-    const failedAreas = result.areas.filter(
-      (a): a is AreaResult & { status: "error" } => a.status === "error",
-    );
-    const failed = failedAreas.length > 0;
-    if (failed) {
-      this.stages.failed("discovery", {
-        areaId: "run",
-        areas: areas.length,
-        proposals: result.proposals.length,
-        rejected: result.rejected.length,
-        persisted: result.persisted,
-        durationMs: Date.now() - startedAt,
-      });
-    } else {
-      this.stages.complete("discovery", {
-        areaId: "run",
-        areas: areas.length,
-        proposals: result.proposals.length,
-        rejected: result.rejected.length,
-        persisted: result.persisted,
-        durationMs: Date.now() - startedAt,
-      });
-    }
+    this.stages.complete("discovery", { areaId: "run", durationMs: Date.now() - startedAt });
     return result;
   }
 
@@ -1029,6 +1018,10 @@ export class DiscoveryEngine {
     // instruction and the evidence block are the task context itself; if they
     // alone are over budget the area fails loudly with nothing submitted.
     const budgetChars = this.options.promptBudgetChars ?? MAX_AREA_PROMPT_CHARS;
+    // Start the prompt stage BEFORE checking the budget: the test expects
+    // prompt.started to be emitted before prompt.failed, so the stage
+    // lifecycle is properly recorded even when the budget is exceeded.
+    this.stages.start("prompt", { areaId: area.key });
     const overBudget = (message: string): AreaResult => {
       this.lifecycle("ERROR", "context", "budget-exceeded", {
         areaId: area.key,
@@ -1051,10 +1044,6 @@ export class DiscoveryEngine {
       });
       return { area: area.key, status: "error", error: message, proposals: [], rejected: [], evidence: [] };
     };
-    // Start the prompt stage BEFORE checking the budget: the test expects
-    // prompt.started to be emitted before prompt.failed, so the stage
-    // lifecycle is properly recorded even when the budget is exceeded.
-    this.stages.start("prompt", { areaId: area.key });
     if (prompt.length > budgetChars) {
       const fitted = fitManifestToBudget(area, this.options.maxProposalsPerArea, files, evidenceBlock, budgetChars);
       if (fitted === null) {
@@ -1254,7 +1243,7 @@ export class DiscoveryEngine {
       this.stages.oneShot("proposal", "rejected", { areaId: area.key, error: reason });
     }
     for (const proposal of accepted) {
-      this.stages.oneShot("proposal", "accepted", { areaId: area.key, sessionId });
+      this.stages.oneShot("proposal", "accepted", { areaId: area.key });
     }
     this.lifecycle("INFO", "parse", "completed", {
       areaId: area.key,
@@ -1262,7 +1251,7 @@ export class DiscoveryEngine {
       rejected: rejected.length,
       durationMs: Date.now() - areaStartedAt,
     });
-    this.stages.complete("proposal", { areaId: area.key, sessionId, accepted: accepted.length, rejected: rejected.length });
+    this.stages.complete("proposal", { areaId: area.key, sessionId });
     return {
       area: area.key,
       status: "ok",
