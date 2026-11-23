@@ -4,6 +4,7 @@ import path from "node:path";
 import { DEFAULT_ENDPOINT, DEFAULT_MODEL_ID, DEFAULT_PROVIDER } from "./defaults.ts";
 import type { RetryPolicy } from "./retry.ts";
 import { DEFAULT_RETRY_POLICY } from "./retry.ts";
+import { resolveEffectiveModel, validateModelSelection } from "./server-model.ts";
 
 export { DEFAULT_ENDPOINT, DEFAULT_MODEL_ID, DEFAULT_PROVIDER };
 
@@ -67,6 +68,16 @@ export const CONFIG_FILE_NAME = "config.json";
 /** Absolute path of the user-level config file: `<home>/.config/diakosys/config.json`. */
 export function userConfigPath(): string {
   return path.join(expandHome(CONFIG_HOME), CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+}
+
+/**
+ * Absolute path of the global OpenCode config used for model discovery.
+ *
+ * Resolved at call time rather than module load: tests and commands rewrite
+ * HOME, and a module-level constant would keep pointing at the old home.
+ */
+function opencodeConfigPath(): string {
+  return path.join(process.env.HOME ?? ".", ".config", "opencode", "opencode.json");
 }
 
 /** Expand `~` in a config location; the location itself stays out of tracked source. */
@@ -193,6 +204,23 @@ export function readUserConfig(): UserConfig | undefined {
   return narrowUserConfig(parsed);
 }
 
+/** mkdir -p the parent, then an atomic tmp+rename write. */
+function writeUserConfigAtomic(configFile: string, config: UserConfig): void {
+  fs.mkdirSync(path.dirname(configFile), { recursive: true });
+  const tempPath = `${configFile}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+    fs.renameSync(tempPath, configFile);
+  } catch (err) {
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch {
+      // Ignore cleanup errors; the original write error is more useful.
+    }
+    throw err;
+  }
+}
+
 /**
  * Resolve the model endpoint in precedence order:
  *   1. DIAKOSYS_ENDPOINT
@@ -215,14 +243,18 @@ export function resolveEndpoint(): string {
  * DIAKOSYS_ORCHESTRATOR_MODEL ("provider/modelId")
  *   > DIAKOSYS_ORCHESTRATOR_PROVIDER + DIAKOSYS_ORCHESTRATOR_MODEL_ID
  *   > provider/modelId saved in `~/.config/diakosys/config.json` by the
- *   first-run setup > documented safe defaults.
+ *   first-run setup > automatic server model discovery > documented safe defaults.
  * The endpoint resolves as DIAKOSYS_ENDPOINT > saved endpoint > safe default
  * (see resolveEndpoint); the agent resolves as DIAKOSYS_ORCHESTRATOR_AGENT >
  * saved agent, with no default (absent means the opencode default agent).
  * Everything is overridable; nothing is secret — credentials stay in the
  * opencode/llama.cpp configuration, never here or in logs.
+ *
+ * If no explicit model is configured, the function attempts to auto-discover
+ * a model from the configured endpoint and configure it in the user's config.
+ * This is an async operation that may require network access.
  */
-export function resolveConfig(): OrchestratorConfig {
+export async function resolveConfig(): Promise<OrchestratorConfig> {
   const fullModel = env("DIAKOSYS_ORCHESTRATOR_MODEL");
   // The first-run setup's saved values sit between the environment and the
   // built-in defaults: explicit env vars still win, but a saved
@@ -241,13 +273,14 @@ export function resolveConfig(): OrchestratorConfig {
   const model = fullModel ?? `${providerOnly}/${modelIdOnly}`;
   const provider = fullModel === undefined ? (providerOnly as string) : model.slice(0, model.indexOf("/"));
   const modelId = fullModel === undefined ? (modelIdOnly as string) : model.slice(model.indexOf("/") + 1);
+  const endpoint = resolveEndpoint();
 
   const base = {
     projectDirectory: env("DIAKOSYS_ORCHESTRATOR_PROJECT_DIR") ?? env("DIAKOSYS_PROJECT_DIR") ?? DEFAULT_PROJECT_DIR,
     provider,
     modelId,
     model,
-    endpoint: resolveEndpoint(),
+    endpoint,
     port: num("DIAKOSYS_ORCHESTRATOR_PORT", DEFAULT_PORT),
     startupTimeoutMs: num("DIAKOSYS_ORCHESTRATOR_STARTUP_TIMEOUT_MS", DEFAULT_STARTUP_TIMEOUT_MS),
     agent: env("DIAKOSYS_ORCHESTRATOR_AGENT") ?? savedString(user?.agent),
@@ -258,8 +291,78 @@ export function resolveConfig(): OrchestratorConfig {
   // per-prompt deadline left, it is a standalone constant (overridable via
   // DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS).
   const taskLeaseTtlMs = num("DIAKOSYS_ORCHESTRATOR_LEASE_TTL_MS", DEFAULT_TASK_LEASE_TTL_MS);
+
+  // If no explicit model was configured (env var or saved config), auto-discover
+  // from the server and update the user config. This happens after all explicit
+  // sources are checked but before returning, ensuring precedence is maintained.
+  // Auto-discovery can be disabled via DIAKOSYS_AUTO_DISCOVERY=false for testing.
+  // Note: We check if the user explicitly set a model (env var or saved config),
+  // not if they used defaults. providerOnly/modelIdOnly may be set to defaults
+  // even when no explicit model is configured.
+  const hasExplicitModel = fullModel !== undefined ||
+    (user?.provider && user?.modelId);
+
+  let effective: Awaited<ReturnType<typeof resolveEffectiveModel>> | undefined;
+
+  if (!hasExplicitModel) {
+    // Allow tests to disable auto-discovery
+    if (env("DIAKOSYS_AUTO_DISCOVERY") === "false") {
+      // Skip discovery, use defaults
+    } else {
+      const discoveryConfigPath = opencodeConfigPath();
+      const discovered = await resolveEffectiveModel(
+        endpoint,
+        discoveryConfigPath,
+        true, // autoDiscover
+        (msg) => process.stderr.write(msg + "\n"),
+      );
+      effective = discovered;
+
+      // Never persist an incomplete or fabricated discovery result: the
+      // provider/model must still resolve in the OpenCode config and belong
+      // to the endpoint we are about to save.
+      if (discovered.provider === undefined || discovered.modelId === undefined) {
+        throw new Error("server-model discovery returned no provider/model");
+      }
+      const validation = validateModelSelection(
+        endpoint,
+        discovered.provider,
+        discovered.modelId,
+        discoveryConfigPath,
+      );
+      if (!validation.valid) {
+        throw new Error(
+          `server-model discovery returned an invalid selection: ${validation.reason ?? "unknown reason"}`,
+        );
+      }
+
+      // Preserve unrelated saved fields (version, agent, extra keys) and keep
+      // an existing display name when discovery does not provide one.
+      const updatedConfig: UserConfig = {
+        ...(user ?? {}),
+        provider: discovered.provider,
+        modelId: discovered.modelId,
+        modelName: discovered.modelName ?? savedString(user?.modelName),
+        endpoint: discovered.endpoint,
+      };
+      writeUserConfigAtomic(userConfigPath(), updatedConfig);
+    }
+  }
+
+  // Use the effective model from discovery (if auto-discovery was performed)
+  let returnedConfig = { ...base };
+  if (effective) {
+    returnedConfig = {
+      ...returnedConfig,
+      provider: effective?.provider ?? base.provider,
+      modelId: effective?.modelId ?? base.modelId,
+      model: effective?.model ?? `${returnedConfig.provider}/${returnedConfig.modelId}`,
+      endpoint: effective?.endpoint ?? base.endpoint,
+    };
+  }
+
   return {
-    ...base,
+    ...returnedConfig,
     lockTtlMs: num("DIAKOSYS_ORCHESTRATOR_LOCK_TTL_MS", Math.max(120_000, 2 * taskLeaseTtlMs)),
     taskLeaseTtlMs,
     retry: {

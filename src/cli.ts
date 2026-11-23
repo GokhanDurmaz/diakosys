@@ -142,15 +142,15 @@ const PLAN_VALUE_FLAGS = new Map<string, "text" | "number">();
       return;
     }
     case "status": {
-      status();
+      await status(argv.slice(1));
       return;
     }
     case "task": {
-      task(argv.slice(1));
+      await task(argv.slice(1));
       return;
     }
     case "recover": {
-      recoverTaskQueue(argv.slice(1));
+      await recoverTaskQueue(argv.slice(1));
       return;
     }
     case "run": {
@@ -162,7 +162,7 @@ const PLAN_VALUE_FLAGS = new Map<string, "text" | "number">();
       return;
     }
     case "plan": {
-      plan(argv.slice(1));
+      await plan(argv.slice(1));
       return;
     }
     case "cycle": {
@@ -170,7 +170,7 @@ const PLAN_VALUE_FLAGS = new Map<string, "text" | "number">();
       return;
     }
     case "tasks": {
-      tasks(argv.slice(1));
+      await tasks(argv.slice(1));
       return;
     }
     default: {
@@ -213,7 +213,7 @@ function usage(code: number): void {
       "Discovery and planning (read-only analysis, no auto-execution):",
       "  discover [--dry-run] [--area a,b,...] [--lifecycle] [--verbose]",
       "                              Inspect the repo with the configured model in read-only mode",
-      "                              --lifecycle/--verbose print the lifecycle and 13-stage",
+      "                              --lifecycle/--verbose print the lifecycle and stage-level",
       "                              pipeline events; both are opt-in, stdout is unchanged by default",
       "  plan                        Validate discovered proposals; queue dependency-ready ones",
       "                              Takes no arguments: any --flag is rejected before the database opens",
@@ -231,7 +231,7 @@ function usage(code: number): void {
   if (code !== 0) process.exitCode = code;
 }
 
-function status(): void {
+async function status(args: string[]): Promise<void> {
   const settings = openStore(defaultDbPath());
   try {
     const counts = new Map<TaskState, number>(TASK_STATES.map((s) => [s, 0]));
@@ -247,7 +247,7 @@ function status(): void {
   }
 }
 
-function task(args: string[]): void {
+async function task(args: string[]): Promise<void> {
   const sub = args[0];
   if (sub === "add") {
     const title = args[1];
@@ -382,7 +382,7 @@ function task(args: string[]): void {
  * malformed and legacy failure classifications are manual-only: they need an
  * explicit --confirm-unsafe. Runs under the coordinator instance lock.
  */
-function retryTask(args: string[]): void {
+async function retryTask(args: string[]): Promise<void> {
   const id = args[0];
   if (id === undefined) {
     process.stderr.write("task retry requires a task id\n");
@@ -392,7 +392,7 @@ function retryTask(args: string[]): void {
   const confirmUnsafe = args.includes("--confirm-unsafe");
   let config: OrchestratorConfig;
   try {
-    config = resolveConfig();
+    config = await resolveConfig();
   } catch (err) {
     process.stderr.write(`config error: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exitCode = 1;
@@ -402,7 +402,7 @@ function retryTask(args: string[]): void {
   let authority: CoordinatorAuthority | undefined;
   try {
     try {
-      authority = acquireCoordinator(settings.db, config, "retry");
+      authority = await acquireCoordinator(settings.db, config, "retry");
     } catch (err) {
       process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
       process.exitCode = 1;
@@ -508,7 +508,7 @@ async function doctor(args: string[]): Promise<void> {
   const useMock = args.includes("--mock");
   let config: OrchestratorConfig;
   try {
-    config = resolveConfig();
+    config = await resolveConfig();
   } catch (err) {
     process.stderr.write(`config error: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exitCode = 1;
@@ -592,7 +592,7 @@ async function run(args: string[]): Promise<void> {
   const max = maxIdx >= 0 && args[maxIdx + 1] !== undefined ? Math.max(1, Number(args[maxIdx + 1])) : 1;
   let config: OrchestratorConfig;
   try {
-    config = resolveConfig();
+    config = await resolveConfig();
   } catch (err) {
     process.stderr.write(`config error: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exitCode = 1;
@@ -716,7 +716,7 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
   const dryRun = args.includes("--dry-run");
   let config: OrchestratorConfig;
   try {
-    config = resolveConfig();
+    config = await resolveConfig();
   } catch (err) {
     process.stderr.write(`config error: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exitCode = 1;
@@ -831,7 +831,12 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
     try {
       result = await engine.run();
     } finally {
-      await discoveryAdapter.close();
+      try {
+        await discoveryAdapter.close();
+      } catch (err) {
+        process.stderr.write(`adapter teardown error: ${err instanceof Error ? err.message : String(err)}\n`);
+        throw err;
+      }
     }
 
     // The auditor runs exactly once on the globally deduplicated proposal
@@ -839,7 +844,22 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
     // persistence. It is deterministic, read-only and filesystem-only — no
     // model call, no agent, no writes. Its verdicts are merged into the run's
     // `rejected` channel and are never persisted themselves.
-    const audited = auditProposals(result, config.projectDirectory);
+    lifecycle?.start("discover", "audit", {
+      proposals: result.proposals.length,
+      rejected: result.rejected.length,
+    });
+    let audited: ReturnType<typeof auditProposals>;
+    try {
+      audited = auditProposals(result, config.projectDirectory);
+    } catch (err) {
+      lifecycle?.error(
+        "discover",
+        "audit",
+        `audit failed: ${err instanceof Error ? err.message : String(err)}`,
+        { proposals: result.proposals.length, rejected: result.rejected.length },
+      );
+      throw err;
+    }
     // Verdicts are execution-local: the auditor's `rejected` channel is folded
     // into the run's existing `rejected` array, and nothing is persisted.
     result.proposals = audited.proposals;
@@ -889,7 +909,7 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
       }
     }
 
-    lifecycle?.log("INFO", "discover", "audit", "completed", {
+    lifecycle?.complete("discover", "audit", {
       accepted: result.proposals.length,
       rejected: result.rejected.length,
     });
@@ -985,6 +1005,7 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
     }
     if (db !== undefined) closeDatabase(db);
     lifecycle?.close();
+    if (adapter !== undefined) await adapter.close();
   }
 
   // Output order is: area headers, then the accepted ids, then the
@@ -1070,7 +1091,7 @@ export function validatePlanArgs(args: string[]): string[] {
   return unknown;
 }
 
-function plan(args: string[]): void {
+async function plan(args: string[]): Promise<void> {
   // `--lifecycle` is this command's opt-in observer flag, not a planning
   // argument: strip it before validation because `validatePlanArgs` rejects
   // any unknown `-`-prefixed flag.
@@ -1088,7 +1109,7 @@ function plan(args: string[]): void {
   }
   let config: OrchestratorConfig;
   try {
-    config = resolveConfig();
+    config = await resolveConfig();
   } catch (err) {
     process.stderr.write(`config error: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exitCode = 1;
@@ -1132,7 +1153,7 @@ function plan(args: string[]): void {
   }
 }
 
-function tasks(args: string[]): void {
+async function tasks(args: string[]): Promise<void> {
   let state: TaskState | undefined;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--state" && args[i + 1] !== undefined) {
@@ -1235,7 +1256,7 @@ async function cycle(args: string[]): Promise<void> {
 
   let config: OrchestratorConfig;
   try {
-    config = resolveConfig();
+    config = await resolveConfig();
   } catch (err) {
     process.stderr.write(`config error: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exitCode = 1;
@@ -1331,13 +1352,13 @@ async function cycle(args: string[]): Promise<void> {
  * recovery happens only here (discovery runs) or here and at cycle start
  * (task leases).
  */
-function recoverTaskQueue(args: string[]): void {
+async function recoverTaskQueue(args: string[]): Promise<void> {
   // discovery runs carry no lease, so interrupting them is never automatic:
   // the operator confirms with --confirm-unsafe (same contract as task retry)
   const confirmUnsafe = args.includes("--confirm-unsafe");
   let config: OrchestratorConfig;
   try {
-    config = resolveConfig();
+    config = await resolveConfig();
   } catch (err) {
     process.stderr.write(`config error: ${err instanceof Error ? err.message : String(err)}\n`);
     process.exitCode = 1;
@@ -1347,7 +1368,7 @@ function recoverTaskQueue(args: string[]): void {
   let authority: CoordinatorAuthority | undefined;
   try {
     try {
-      authority = acquireCoordinator(settings.db, config, "recover");
+      authority = await acquireCoordinator(settings.db, config, "recover");
     } catch (err) {
       process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
       process.exitCode = 1;

@@ -58,32 +58,42 @@ export class StageLogger {
     this.now = options.now ?? Date.now;
   }
 
-  /** Record a stage start; idempotent for the same stage key. */
-  start(stage: string): void {
-    if (this.startedAt.has(stage)) return;
-    this.startedAt.set(stage, this.now());
+  /** Record a stage start; idempotent for the same stage+area pair. */
+  start(stage: string, extra: Record<string, unknown> = {}): void {
+    const key = `${stage}:${extra.areaId ?? "run"}`;
+    if (this.startedAt.has(key)) return;
+    this.startedAt.set(key, this.now());
+    this.outcome(stage, "started", extra);
   }
 
-  /** Elapsed ms since the stage started, or `undefined` if it never started. */
-  elapsed(stage: string): number | undefined {
-    const startedAt = this.startedAt.get(stage);
+  /** Elapsed ms since the stage started, or `undefined` if it never started. Does not clear the tracking entry. */
+  elapsed(stage: string, extra?: Record<string, unknown>): number | undefined {
+    const key = `${stage}:${extra?.areaId ?? "run"}`;
+    const startedAt = this.startedAt.get(key);
+    // Don't clear the entry - callers may call elapsed() multiple times
     return startedAt === undefined ? undefined : this.now() - startedAt;
   }
 
   /** Complete a started stage: emits `completed` with durationMs. */
   complete(stage: string, extra: Record<string, unknown> = {}): void {
-    const startedAt = this.startedAt.get(stage);
+    const key = `${stage}:${extra.areaId ?? "run"}`;
+    const startedAt = this.startedAt.get(key);
     if (startedAt === undefined) return;
-    this.startedAt.delete(stage);
+    this.startedAt.delete(key);
     this.outcome(stage, "completed", { ...extra, durationMs: this.now() - startedAt });
   }
 
-  /** Report a stage that never completed (extraction failure, prompt error). */
+  /** Report a stage that never completed (extraction failure, prompt error). Only emits if the stage was started. */
   failed(stage: string, extra: Record<string, unknown> = {}): void {
-    const startedAt = this.startedAt.get(stage);
-    if (startedAt === undefined) return;
-    this.startedAt.delete(stage);
-    this.outcome(stage, "failed", extra);
+    const key = `${stage}:${extra.areaId ?? "run"}`;
+    const startedAt = this.startedAt.get(key);
+    // Only emit failed if the stage was started (match complete() behavior)
+    if (startedAt !== undefined) {
+      // Use durationMs from caller if provided (from elapsed()), otherwise calculate
+      const durationMs = extra.durationMs ?? this.now() - startedAt;
+      this.outcome(stage, "failed", { ...extra, durationMs });
+      this.startedAt.delete(key);
+    }
   }
 
   /** Fire a one-shot stage transition (no duration); every call emits. */

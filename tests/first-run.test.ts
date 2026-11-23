@@ -558,115 +558,132 @@ test("both selections are made before anything is written: a failing agent pick 
 
 // ——— saved-config loading: resolveConfig / resolveEndpoint ———
 
-test("without a user config, resolveConfig falls back to the documented defaults", () => {
-  withIsolatedEnv(() => {
-    const home = tempDir("diakosys-resolve-");
-    process.env.HOME = home;
-    const config = resolveConfig();
-    assert.equal(config.provider, "mimo-llama-m5");
-    assert.equal(config.modelId, "mimo-2.6-9b-q6");
-    assert.equal(config.model, "mimo-llama-m5/mimo-2.6-9b-q6");
-    assert.equal(config.agent, undefined);
-    assert.equal(config.endpoint, "http://localhost:8082/v1");
-  });
+test("without a user config, resolveConfig falls back to the documented defaults", async () => {
+  const home = tempDir("diakosys-resolve-");
+  process.env.HOME = home;
+  // Disable auto-discovery to test fallback behavior
+  process.env.DIAKOSYS_AUTO_DISCOVERY = "false";
+  const config = await resolveConfig();
+  assert.equal(config.provider, "mimo-llama-m5");
+  assert.equal(config.modelId, "mimo-2.6-9b-q6");
+  assert.equal(config.model, "mimo-llama-m5/mimo-2.6-9b-q6");
+  assert.equal(config.agent, undefined);
+  assert.equal(config.endpoint, "http://localhost:8082/v1");
+  process.env.HOME = "";
+  delete process.env.DIAKOSYS_AUTO_DISCOVERY;
+  try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
 });
 
-test("a saved first-run config supplies provider, model, agent and the remote endpoint", () => {
-  withIsolatedEnv(() => {
-    const home = tempDir("diakosys-resolve-");
-    writeJson(diakosysConfigPath(home), {
-      version: 1,
-      endpoint: REMOTE_ENDPOINT,
-      provider: "mimo-q8-m5",
-      modelId: "mimo-q8",
-      modelName: "MiMo-V2.6-Distill-Qwen-9B Q8_0",
-      agent: "plan",
-    });
-    process.env.HOME = home;
-    const config = resolveConfig();
-    assert.equal(config.provider, "mimo-q8-m5");
-    assert.equal(config.modelId, "mimo-q8");
-    assert.equal(config.model, "mimo-q8-m5/mimo-q8");
-    assert.equal(config.agent, "plan");
-    // No silent localhost fallback: the explicitly selected remote endpoint stands.
-    assert.equal(config.endpoint, REMOTE_ENDPOINT);
-    assert.equal(resolveEndpoint(), REMOTE_ENDPOINT);
+test("a saved first-run config supplies provider, model, agent and the remote endpoint", async () => {
+  const home = tempDir("diakosys-resolve-");
+  writeJson(diakosysConfigPath(home), {
+    version: 1,
+    endpoint: REMOTE_ENDPOINT,
+    provider: "mimo-q8-m5",
+    modelId: "mimo-q8",
+    modelName: "MiMo-V2.6-Distill-Qwen-9B Q8_0",
+    agent: "plan",
   });
+  process.env.HOME = home;
+  const config = await resolveConfig();
+  assert.equal(config.provider, "mimo-q8-m5");
+  assert.equal(config.modelId, "mimo-q8");
+  assert.equal(config.model, "mimo-q8-m5/mimo-q8");
+  assert.equal(config.agent, "plan");
+  // No silent localhost fallback: the explicitly selected remote endpoint stands.
+  assert.equal(config.endpoint, REMOTE_ENDPOINT);
+  assert.equal(resolveEndpoint(), REMOTE_ENDPOINT);
+  process.env.HOME = "";
+  try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
 });
 
-test("environment variables win over the saved first-run config", () => {
-  withIsolatedEnv(() => {
-    const home = tempDir("diakosys-resolve-");
-    writeJson(diakosysConfigPath(home), {
-      version: 1,
-      endpoint: REMOTE_ENDPOINT,
-      provider: "mimo-q8-m5",
-      modelId: "mimo-q8",
-      agent: "plan",
-    });
-    process.env.HOME = home;
-    process.env.DIAKOSYS_ENDPOINT = OTHER_ENDPOINT;
-    process.env.DIAKOSYS_ORCHESTRATOR_PROVIDER = "env-provider";
-    process.env.DIAKOSYS_ORCHESTRATOR_MODEL_ID = "env-model";
-    process.env.DIAKOSYS_ORCHESTRATOR_AGENT = "build";
-    const config = resolveConfig();
-    assert.equal(config.provider, "env-provider");
-    assert.equal(config.modelId, "env-model");
-    assert.equal(config.model, "env-provider/env-model");
-    assert.equal(config.agent, "build");
-    assert.equal(config.endpoint, OTHER_ENDPOINT);
+test("environment variables win over the saved first-run config", async () => {
+  const home = tempDir("diakosys-resolve-");
+  writeJson(diakosysConfigPath(home), {
+    version: 1,
+    endpoint: REMOTE_ENDPOINT,
+    provider: "mimo-q8-m5",
+    modelId: "mimo-q8",
+    agent: "plan",
   });
+  process.env.HOME = home;
+  process.env.DIAKOSYS_ENDPOINT = OTHER_ENDPOINT;
+  process.env.DIAKOSYS_ORCHESTRATOR_PROVIDER = "env-provider";
+  process.env.DIAKOSYS_ORCHESTRATOR_MODEL_ID = "env-model";
+  process.env.DIAKOSYS_ORCHESTRATOR_AGENT = "build";
+  const config = await resolveConfig();
+  assert.equal(config.provider, "env-provider");
+  assert.equal(config.modelId, "env-model");
+  assert.equal(config.model, "env-provider/env-model");
+  assert.equal(config.agent, "build");
+  assert.equal(config.endpoint, OTHER_ENDPOINT);
+  process.env.HOME = "";
+  process.env.DIAKOSYS_ENDPOINT = "";
+  process.env.DIAKOSYS_ORCHESTRATOR_PROVIDER = "";
+  process.env.DIAKOSYS_ORCHESTRATOR_MODEL_ID = "";
+  process.env.DIAKOSYS_ORCHESTRATOR_AGENT = "";
+  try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
 });
 
-test("DIAKOSYS_ORCHESTRATOR_MODEL replaces provider/model entirely, the saved agent still applies", () => {
-  withIsolatedEnv(() => {
-    const home = tempDir("diakosys-resolve-");
-    writeJson(diakosysConfigPath(home), {
-      version: 1,
-      endpoint: REMOTE_ENDPOINT,
-      provider: "mimo-q8-m5",
-      modelId: "mimo-q8",
-      agent: "plan",
-    });
-    process.env.HOME = home;
-    process.env.DIAKOSYS_ORCHESTRATOR_MODEL = "Qwen-Mimo/model.gguf";
-    const config = resolveConfig();
-    assert.equal(config.model, "Qwen-Mimo/model.gguf");
-    assert.equal(config.provider, "Qwen-Mimo");
-    assert.equal(config.modelId, "model.gguf");
-    assert.equal(config.agent, "plan");
+test("DIAKOSYS_ORCHESTRATOR_MODEL replaces provider/model entirely, the saved agent still applies", async () => {
+  const home = tempDir("diakosys-resolve-");
+  writeJson(diakosysConfigPath(home), {
+    version: 1,
+    endpoint: REMOTE_ENDPOINT,
+    provider: "mimo-q8-m5",
+    modelId: "mimo-q8",
+    agent: "plan",
   });
+  process.env.HOME = home;
+  process.env.DIAKOSYS_ORCHESTRATOR_MODEL = "Qwen-Mimo/model.gguf";
+  // Disable auto-discovery to prevent it from overwriting the explicit model
+  process.env.DIAKOSYS_AUTO_DISCOVERY = "false";
+  const config = await resolveConfig();
+  assert.equal(config.model, "Qwen-Mimo/model.gguf");
+  assert.equal(config.provider, "Qwen-Mimo");
+  assert.equal(config.modelId, "model.gguf");
+  assert.equal(config.agent, "plan");
+  process.env.HOME = "";
+  delete process.env.DIAKOSYS_AUTO_DISCOVERY;
+  process.env.DIAKOSYS_ORCHESTRATOR_MODEL = "";
+  try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
 });
 
-test("a partially saved config fills the missing side from the defaults", () => {
-  withIsolatedEnv(() => {
-    const home = tempDir("diakosys-resolve-");
-    writeJson(diakosysConfigPath(home), { provider: "mimo-q8-m5" });
-    process.env.HOME = home;
-    const config = resolveConfig();
-    assert.equal(config.provider, "mimo-q8-m5");
-    assert.equal(config.modelId, "mimo-2.6-9b-q6");
-    assert.equal(config.agent, undefined);
-  });
+test("a partially saved config fills the missing side from the defaults", async () => {
+  const home = tempDir("diakosys-resolve-");
+  writeJson(diakosysConfigPath(home), { provider: "mimo-q8-m5" });
+  process.env.HOME = home;
+  // Disable auto-discovery to test that saved config takes precedence
+  process.env.DIAKOSYS_AUTO_DISCOVERY = "false";
+  const config = await resolveConfig();
+  assert.equal(config.provider, "mimo-q8-m5");
+  assert.equal(config.modelId, "mimo-2.6-9b-q6");
+  assert.equal(config.agent, undefined);
+  process.env.HOME = "";
+  delete process.env.DIAKOSYS_AUTO_DISCOVERY;
+  try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
 });
 
-test("junk saved values are ignored: defaults win and nothing crashes", () => {
-  withIsolatedEnv(() => {
-    const home = tempDir("diakosys-resolve-");
-    writeJson(diakosysConfigPath(home), {
-      version: 1,
-      provider: 42,
-      modelId: ["not", "a", "string"],
-      agent: "",
-      endpoint: REMOTE_ENDPOINT,
-    });
-    process.env.HOME = home;
-    const config = resolveConfig();
-    assert.equal(config.provider, "mimo-llama-m5");
-    assert.equal(config.modelId, "mimo-2.6-9b-q6");
-    assert.equal(config.agent, undefined);
-    assert.equal(config.endpoint, REMOTE_ENDPOINT);
+test("junk saved values are ignored: defaults win and nothing crashes", async () => {
+  const home = tempDir("diakosys-resolve-");
+  writeJson(diakosysConfigPath(home), {
+    version: 1,
+    provider: 42,
+    modelId: ["not", "a", "string"],
+    agent: "",
+    endpoint: REMOTE_ENDPOINT,
   });
+  process.env.HOME = home;
+  // Disable auto-discovery to test that defaults are used for invalid values
+  process.env.DIAKOSYS_AUTO_DISCOVERY = "false";
+  const config = await resolveConfig();
+  assert.equal(config.provider, "mimo-llama-m5");
+  assert.equal(config.modelId, "mimo-2.6-9b-q6");
+  assert.equal(config.agent, undefined);
+  assert.equal(config.endpoint, REMOTE_ENDPOINT);
+  process.env.HOME = "";
+  delete process.env.DIAKOSYS_AUTO_DISCOVERY;
+  try { fs.rmSync(home, { recursive: true, force: true }); } catch {}
 });
 
 // ——— shouldRunFirstRunSetup: the interactive gate ———

@@ -1444,7 +1444,7 @@ test("the example JSON embedded in the discovery prompt passes validateProposal"
   }
 });
 
-// ——— 13-stage pipeline observability ———
+// ——— stage-level pipeline observability ———
 // All stage transitions are emitted from the engine's per-area path (src/
 // discovery.ts), so these tests assert the observable contract directly:
 // which events fire, in what order, with which per-area context — while the
@@ -1484,7 +1484,23 @@ test("stage events fire in pipeline order for a successful run", async () => {
     // The engine's own lifecycle events (run/area/model-request/parse) are
     // interleaved; only the stage channel is ordered here. Each of the two
     // areas runs the full per-area pipeline between the run's bookends.
-    const expectedEvents = ["discovery:started", "evidence:started", "evidence:completed", "prompt:prepared", "opencode:submitted", "opencode:completed", "response:parsed", "proposal:accepted", "evidence:started", "evidence:completed", "prompt:prepared", "opencode:submitted", "opencode:completed", "response:parsed", "proposal:accepted", "discovery:completed"];
+    const areaPipeline = [
+      "evidence:started",
+      "evidence:completed",
+      "prompt:started",
+      "prompt:prepared",
+      "prompt:completed",
+      "opencode:started",
+      "opencode:submitted",
+      "opencode:completed",
+      "response:started",
+      "response:parsed",
+      "response:completed",
+      "proposal:started",
+      "proposal:accepted",
+      "proposal:completed",
+    ];
+    const expectedEvents = ["discovery:started", ...areaPipeline, ...areaPipeline, "discovery:completed"];
     assert.deepEqual(stageEvents.map((e) => `${e.stage}:${e.event}`), expectedEvents);
     // exactly one event per transition: the stage logger's guards are not
     // defeated by two areas sharing the same adapter/session
@@ -1496,6 +1512,10 @@ test("stage events fire in pipeline order for a successful run", async () => {
     assert.equal(events.filter((e) => e.stage === "evidence" && e.event === "completed").length, 2);
     assert.equal(events.filter((e) => e.stage === "prompt" && e.event === "prepared").length, 2);
     assert.equal(events.filter((e) => e.stage === "opencode" && e.event === "submitted").length, 2);
+    for (const stage of ["evidence", "prompt", "opencode", "response", "proposal"]) {
+      assert.equal(events.filter((e) => e.stage === stage && e.event === "started").length, 2, `${stage}.started fires once per area`);
+      assert.equal(events.filter((e) => e.stage === stage && e.event === "completed").length, 2, `${stage}.completed fires once per area`);
+    }
   } finally {
     fs.rmSync(cacheDir, { recursive: true, force: true });
   }
@@ -1511,7 +1531,24 @@ test("stage events carry per-area correlation (areaId + session id)", async () =
     const stages = events.filter((e) => e.stage !== undefined && stageNames.has(e.stage) && e.event !== "turn-stats");
     const architecture = stages.filter((e) => e.areaId === "architecture");
     const tests = stages.filter((e) => e.areaId === "tests");
-    for (const expectedEvent of ["discovery.started", "evidence.started", "prompt.prepared", "opencode.submitted", "opencode.completed", "response.parsed", "proposal.accepted", "discovery.completed"]) {
+    for (const expectedEvent of [
+      "discovery.started",
+      "evidence.started",
+      "evidence.completed",
+      "prompt.started",
+      "prompt.prepared",
+      "prompt.completed",
+      "opencode.started",
+      "opencode.submitted",
+      "opencode.completed",
+      "response.started",
+      "response.parsed",
+      "response.completed",
+      "proposal.started",
+      "proposal.accepted",
+      "proposal.completed",
+      "discovery.completed",
+    ]) {
       const [stage, eventPart] = expectedEvent.split(".");
       // discovery events are run-level, not area-level
       if (stage === "discovery") {
@@ -1590,6 +1627,77 @@ test("evidence failure durations are real elapsed times, never invented", async 
   }
 });
 
+test("every started stage completes once per area with a real duration", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const { adapter, engine, events } = stageEngine(dir, cacheDir);
+  try {
+    await engine.run();
+    const stageNames = new Set(["discovery", "evidence", "prompt", "opencode", "response", "proposal"]);
+    const stages = events.filter((e) => e.stage !== undefined && stageNames.has(e.stage) && e.event !== "turn-stats");
+    // start events carry context only; duration belongs to the outcome
+    for (const started of stages.filter((e) => e.event === "started")) {
+      assert.equal(started.durationMs, undefined, `${started.stage}.started must not invent a duration`);
+    }
+    // every completion reports a real elapsed time
+    for (const completed of stages.filter((e) => e.event === "completed")) {
+      assert.equal(typeof completed.durationMs, "number", `${completed.stage}.completed carries durationMs`);
+      assert.ok(completed.durationMs! >= 0, `${completed.stage}.completed duration is never negative`);
+    }
+    // each per-area stage starts and completes exactly once for its area
+    for (const areaId of ["architecture", "tests"]) {
+      for (const stage of ["evidence", "prompt", "opencode", "response", "proposal"]) {
+        const scoped = stages.filter((e) => e.areaId === areaId && e.stage === stage);
+        assert.equal(scoped.filter((e) => e.event === "started").length, 1, `${stage}.started fires once for ${areaId}`);
+        assert.equal(scoped.filter((e) => e.event === "completed").length, 1, `${stage}.completed fires once for ${areaId}`);
+      }
+    }
+    const proposalDone = stages.find(
+      (e) => e.areaId === "architecture" && e.stage === "proposal" && e.event === "completed",
+    ) as (LifecycleEvent & { accepted?: number; rejected?: number }) | undefined;
+    assert.equal(proposalDone?.accepted, 1);
+    assert.equal(proposalDone?.rejected, 0);
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("prompt budget failure emits prompt.failed and never starts the model stages", async () => {
+  const dir = tmpRepo();
+  const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
+  const { adapter, engine, events } = stageEngine(dir, cacheDir, {
+    areas: ["architecture"],
+    promptBudgetChars: 10,
+  });
+  try {
+    const result = await engine.run();
+    assert.equal(result.areas[0]?.status, "error");
+    assert.match(result.areas[0]?.error ?? "", /context budget exceeded/);
+
+    const started = events.find((e) => e.stage === "prompt" && e.event === "started")!;
+    assert.equal(started.areaId, "architecture");
+    const failed = events.find((e) => e.stage === "prompt" && e.event === "failed")!;
+    assert.equal(failed.areaId, "architecture");
+    assert.match(failed.error ?? "", /context budget exceeded/);
+    assert.equal(typeof failed.durationMs, "number", "the failed prompt stage reports its elapsed time");
+    assert.ok(failed.durationMs! >= 0);
+
+    assert.equal(events.filter((e) => e.stage === "prompt" && e.event === "prepared").length, 0);
+    assert.equal(events.filter((e) => e.stage === "prompt" && e.event === "completed").length, 0);
+    assert.equal(events.filter((e) => e.stage === "opencode").length, 0, "no model stage starts after the prompt failure");
+    assert.equal(events.filter((e) => e.stage === "response").length, 0);
+    assert.equal(events.filter((e) => e.stage === "proposal").length, 0);
+
+    const runFailed = events.find((e) => e.stage === "discovery" && e.event === "failed")!;
+    assert.equal(runFailed.areaId, "run");
+    assert.equal(typeof runFailed.durationMs, "number");
+  } finally {
+    await adapter.close();
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+});
+
 test("opencode failure events carry the error, the elapsed time and the session id", async () => {
   const dir = tmpRepo();
   const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "diakosys-cache-"));
@@ -1612,13 +1720,16 @@ test("opencode failure events carry the error, the elapsed time and the session 
     const failed = events.find((e) => e.stage === "opencode" && e.event === "failed")!;
     assert.equal(failed.areaId, "architecture");
     assert.match(failed.error ?? "", /model connection refused/);
-    // sessionId is not on LifecycleEvent; we can't assert it here
-    // the prompt-prepared stage is backtracked with the same error
-    const prepared = events.find((e) => e.stage === "prompt" && e.event === "prepared" && e.error !== undefined);
-    assert.ok(prepared !== undefined);
-    assert.match(prepared.error ?? "", /model connection refused/);
-    // no completion for the failed prompt
+    assert.equal(typeof failed.durationMs, "number", "a failed stage still reports its elapsed time");
+    assert.ok(failed.durationMs! >= 0);
+    // the prompt itself was prepared successfully; only the model stage failed
+    assert.equal(events.filter((e) => e.stage === "prompt" && e.event === "prepared").length, 1);
+    assert.equal(events.filter((e) => e.stage === "prompt" && e.event === "completed").length, 1);
+    // no completion for the failed model stage
     assert.equal(events.filter((e) => e.stage === "opencode" && e.event === "completed").length, 0);
+    // the failed stage never started the response/proposal stages
+    assert.equal(events.filter((e) => e.stage === "response" && e.event === "started").length, 0);
+    assert.equal(events.filter((e) => e.stage === "proposal" && e.event === "started").length, 0);
     // a run whose area errored ends in the run-level discovery.failed event
     const runFailed = events.find((e) => e.stage === "discovery" && e.event === "failed");
     assert.equal(runFailed?.areaId, "run", "discovery.failed is a run-level event");

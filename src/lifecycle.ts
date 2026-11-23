@@ -79,6 +79,10 @@ export interface LifecycleEvent {
   detail?: string;
   /** sanitized error summary (never a full stack / raw model response). */
   error?: string;
+  /** Number of proposals accepted in this stage (proposal.completed only). */
+  accepted?: number;
+  /** Number of proposals rejected in this stage (proposal.completed only). */
+  rejected?: number;
 }
 
 export interface LifecycleLoggerOptions {

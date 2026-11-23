@@ -826,8 +826,7 @@ export class DiscoveryEngine {
       areas: selectAreas(this.options.areas).length,
       dryRun: this.options.dryRun === true,
     });
-    this.stages.start("discovery");
-    this.stages.oneShot("discovery", "started", { areaId: "run" });
+    this.stages.start("discovery", { areaId: "run" });
     const startedAt = Date.now();
     const areas = selectAreas(this.options.areas);
     const allProposals: Proposal[] = [];
@@ -958,8 +957,7 @@ export class DiscoveryEngine {
   private async runArea(area: DiscoveryArea, total: number): Promise<AreaResult> {
     const areaStartedAt = Date.now();
     this.lifecycle("INFO", "area", "started", { areaId: area.key, total });
-    this.stages.start("evidence");
-    this.stages.oneShot("evidence", "started", { areaId: area.key });
+    this.stages.start("evidence", { areaId: area.key });
     let sessionId: string | undefined;
     let prompt: string;
     let files: string[] = [];
@@ -984,7 +982,7 @@ export class DiscoveryEngine {
         // block — that is the existing behaviour — but the area's evidence step
         // is reported as extraction_failed, so a silent no-evidence run is
         // observable instead of looking like a clean run.
-        const elapsedMs = this.stages.elapsed("evidence");
+        const elapsedMs = this.stages.elapsed("evidence", area.key);
         this.stages.failed("evidence", {
           areaId: area.key,
           error: "no source excerpts extracted",
@@ -996,12 +994,13 @@ export class DiscoveryEngine {
         });
       } else {
         evidenceBlock = renderSourceEvidenceBlock(excerpts);
+        // Mark evidence stage as complete immediately after evidence block is created
         this.stages.complete("evidence", { areaId: area.key, sessionId });
       }
       prompt = areaInstruction(area, this.options.maxProposalsPerArea, files.join("\n"), evidenceBlock);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const elapsedMs = this.stages.elapsed("evidence");
+      const elapsedMs = this.stages.elapsed("evidence", area.key);
       this.stages.failed("evidence", {
         areaId: area.key,
         error: message,
@@ -1037,6 +1036,12 @@ export class DiscoveryEngine {
         budgetChars,
         error: message,
       });
+      const promptElapsedMs = this.stages.elapsed("prompt", area.key) ?? 0;
+      this.stages.failed("prompt", {
+        areaId: area.key,
+        error: message,
+        durationMs: promptElapsedMs,
+      });
       this.lifecycle("INFO", "area", "completed", {
         areaId: area.key,
         status: "error",
@@ -1046,6 +1051,10 @@ export class DiscoveryEngine {
       });
       return { area: area.key, status: "error", error: message, proposals: [], rejected: [], evidence: [] };
     };
+    // Start the prompt stage BEFORE checking the budget: the test expects
+    // prompt.started to be emitted before prompt.failed, so the stage
+    // lifecycle is properly recorded even when the budget is exceeded.
+    this.stages.start("prompt", { areaId: area.key });
     if (prompt.length > budgetChars) {
       const fitted = fitManifestToBudget(area, this.options.maxProposalsPerArea, files, evidenceBlock, budgetChars);
       if (fitted === null) {
@@ -1067,10 +1076,13 @@ export class DiscoveryEngine {
             `(manifest could not be fitted); no request submitted`,
         );
       }
+      this.stages.oneShot("prompt", "prepared", { areaId: area.key, sessionId });
+    } else {
+      // If the first prompt already fits, emit prepared
+      this.stages.oneShot("prompt", "prepared", { areaId: area.key, sessionId });
     }
-    this.stages.oneShot("prompt", "prepared", { areaId: area.key, sessionId });
     this.stages.complete("prompt", { areaId: area.key, sessionId });
-    this.stages.start("opencode");
+    this.stages.start("opencode", { areaId: area.key });
     this.stages.oneShot("opencode", "submitted", { areaId: area.key });
     // One area = one session: every area starts a fresh OpenCode session so
     // context never accumulates across areas — a shared session grows until a
@@ -1080,7 +1092,7 @@ export class DiscoveryEngine {
       sessionId = await this.adapter.beginSession?.();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const elapsedMs = this.stages.elapsed("opencode");
+      const elapsedMs = this.stages.elapsed("opencode", area.key);
       this.stages.failed("opencode", {
         areaId: area.key,
         error: message,
@@ -1147,16 +1159,12 @@ export class DiscoveryEngine {
         ]).finally(() => clearGrace());
       }
       this.emitTurnStats(extractTurnStats(err), area.key);
-      const opencodeElapsedMs = this.stages.elapsed("opencode");
+      const opencodeElapsedMs = this.stages.elapsed("opencode", area.key);
       this.stages.failed("opencode", {
         areaId: area.key,
         error: message,
         durationMs: opencodeElapsedMs,
       });
-      // The prompt stage is backtracked with the failure's error: the area
-      // died after its prompt was prepared, so the prompt's fate is visible
-      // on the stage channel alongside opencode.failed.
-      this.stages.oneShot("prompt", "prepared", { areaId: area.key, error: message });
       this.lifecycle("ERROR", "model-request", "error", { areaId: area.key, error: message });
       this.lifecycle("INFO", "area", "completed", {
         areaId: area.key,
@@ -1182,6 +1190,7 @@ export class DiscoveryEngine {
     });
     this.stages.complete("opencode", { areaId: area.key, sessionId });
     this.stages.complete("prompt", { areaId: area.key, sessionId });
+    this.stages.start("response", { areaId: area.key });
     this.stages.oneShot("response", "parsed", { areaId: area.key, sessionId });
     const { items, parseErrors, segments, truncated } = extractJsonCandidates(response.text);
     const rejected: RejectedProposal[] = parseErrors.map((reason) => ({ area: area.key, reason, raw: reason }));
@@ -1239,26 +1248,21 @@ export class DiscoveryEngine {
       accepted.push(validated.proposal);
       if (accepted.length >= this.options.maxProposalsPerArea) break;
     }
+    this.stages.complete("response", { areaId: area.key, sessionId });
+    this.stages.start("proposal", { areaId: area.key });
     for (const reason of rejected.map((r) => r.reason)) {
       this.stages.oneShot("proposal", "rejected", { areaId: area.key, error: reason });
     }
     for (const proposal of accepted) {
       this.stages.oneShot("proposal", "accepted", { areaId: area.key, sessionId });
     }
-    this.stages.complete("evidence", { areaId: area.key, sessionId });
     this.lifecycle("INFO", "parse", "completed", {
       areaId: area.key,
       accepted: accepted.length,
       rejected: rejected.length,
       durationMs: Date.now() - areaStartedAt,
     });
-    this.lifecycle("INFO", "area", "completed", {
-      areaId: area.key,
-      status: "ok",
-      proposals: accepted.length,
-      rejected: rejected.length,
-      durationMs: Date.now() - areaStartedAt,
-    });
+    this.stages.complete("proposal", { areaId: area.key, sessionId, accepted: accepted.length, rejected: rejected.length });
     return {
       area: area.key,
       status: "ok",
