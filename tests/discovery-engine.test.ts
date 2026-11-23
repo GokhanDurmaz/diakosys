@@ -1,5 +1,3 @@
-// Force recompilation by touching this line
-console.log("DEBUG TEST FILE LOADED");
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -1462,9 +1460,6 @@ function stageEngine(
 ): { adapter: MockOpenCodeAdapter; engine: DiscoveryEngine; events: LifecycleEvent[] } {
   const events: LifecycleEvent[] = [];
   const adapter = new MockOpenCodeAdapter(() => JSON.stringify([proposal("Stage logger proposal", 6, "low")]));
-  console.log(`DEBUG stageEngine: received options=${JSON.stringify(options)}`);
-  console.log(`DEBUG stageEngine: options.promptBudgetChars=${options.promptBudgetChars}`);
-  console.log(`DEBUG stageEngine: about to call DiscoveryEngine constructor`);
   const engine = new DiscoveryEngine(adapter, {
     repoDir: dir,
     model: MODEL,
@@ -1475,8 +1470,6 @@ function stageEngine(
     now,
     ...options,
   });
-  console.log(`DEBUG stageEngine: after constructor, checking engine...`);
-  console.log(`DEBUG stageEngine: engine.options.promptBudgetChars=${engine.options?.promptBudgetChars}`);
   return { adapter, engine, events };
 }
 
