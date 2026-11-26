@@ -96,10 +96,10 @@ test("a throwing StageLogger observer cannot interrupt discovery", () => {
 
 test("StageLogger elapsed is measured from the stage start", () => {
   const { logger, advance } = capture();
-  assert.equal(logger.elapsed("evidence", { areaId: "architecture" }), undefined);
+  assert.equal(logger.elapsed("evidence", "architecture"), undefined);
   logger.start("evidence", { areaId: "architecture" });
   advance(42);
-  assert.equal(logger.elapsed("evidence", { areaId: "architecture" }), 42);
+  assert.equal(logger.elapsed("evidence", "architecture"), 42);
   logger.complete("evidence", { areaId: "architecture" });
-  assert.equal(logger.elapsed("evidence", { areaId: "architecture" }), undefined);
+  assert.equal(logger.elapsed("evidence", "architecture"), undefined);
 });

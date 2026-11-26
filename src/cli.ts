@@ -30,6 +30,7 @@ import { auditProposals } from "./auditor.ts";
 import { persistProposals } from "./persist.ts";
 import { runCycle } from "./cycle.ts";
 import { LifecycleLogger, type LifecycleEvent } from "./lifecycle.ts";
+import { eventBus } from "./events.ts";
 import type { Proposal } from "./proposal.ts";
 import {
   acquireInstanceLock,
@@ -826,6 +827,8 @@ export async function discover(args: string[], adapter?: OpenCodeAdapter): Promi
             onLifecycle: (ev: LifecycleEvent) => lifecycle.emitEvent(ev),
           }
         : {}),
+      // Wire discovery events to EventBus for SSE streaming
+      ...(eventBus ? { eventBus } : {}),
     });
 
     try {

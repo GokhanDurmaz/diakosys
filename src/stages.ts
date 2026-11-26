@@ -70,8 +70,8 @@ export class StageLogger {
   }
 
   /** Elapsed ms since the stage started, or `undefined` if it never started. Does not clear the tracking entry. */
-  elapsed(stage: string, extra?: Record<string, unknown>): number | undefined {
-    const key = `${stage}:${extra?.areaId ?? "run"}`;
+  elapsed(stage: string, areaId?: string): number | undefined {
+    const key = `${stage}:${areaId ?? "run"}`;
     const startedAt = this.startedAt.get(key);
     // Don't clear the entry - callers may call elapsed() multiple times
     return startedAt === undefined ? undefined : this.now() - startedAt;

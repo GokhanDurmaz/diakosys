@@ -95,6 +95,65 @@ const MIGRATIONS: readonly Migration[] = [
       );
     },
   },
+  {
+    version: 4,
+    name: "create-sse-event-storage",
+    apply(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS sse_events (
+          id              TEXT PRIMARY KEY,
+          timestamp       INTEGER NOT NULL,
+          event_type      TEXT NOT NULL,
+          aggregate_type  TEXT NOT NULL,
+          aggregate_id    TEXT NOT NULL,
+          payload         TEXT NOT NULL,
+          schema_version  INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_sse_events_timestamp ON sse_events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_sse_events_aggregate ON sse_events(aggregate_type, aggregate_id);
+      `);
+    },
+  },
+  {
+    version: 5,
+    name: "migrate-sse-events-to-sequence",
+    apply(db) {
+      // Check if migration already completed by checking for sequence column
+      const hasSequence = db.prepare(
+        "PRAGMA table_info(sse_events)",
+      ).all() as unknown as { name: string }[];
+      if (hasSequence.some((c) => c.name === "sequence")) return;
+
+      // Create the new table with sequence as primary key
+      db.exec(`
+        CREATE TABLE sse_events_new (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          id TEXT NOT NULL UNIQUE,
+          timestamp INTEGER NOT NULL,
+          event_type TEXT NOT NULL,
+          aggregate_type TEXT NOT NULL,
+          aggregate_id TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          schema_version INTEGER NOT NULL DEFAULT 1
+        );
+      `);
+
+      // Copy all records maintaining order
+      db.exec(`INSERT INTO sse_events_new (id, timestamp, event_type, aggregate_type, aggregate_id, payload, schema_version)
+                SELECT id, timestamp, event_type, aggregate_type, aggregate_id, payload, schema_version
+                FROM sse_events
+                ORDER BY rowid ASC;`);
+
+      // Drop old table and rename new one
+      db.exec("DROP TABLE sse_events;");
+      db.exec("ALTER TABLE sse_events_new RENAME TO sse_events;");
+
+      // Recreate indexes
+      db.exec("CREATE INDEX IF NOT EXISTS idx_sse_events_timestamp ON sse_events(timestamp);");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_sse_events_aggregate ON sse_events(aggregate_type, aggregate_id);");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_sse_events_id ON sse_events(id);");
+    },
+  },
 ];
 
 const SQLITE_MAGIC = "SQLite format 3";

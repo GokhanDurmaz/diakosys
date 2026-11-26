@@ -15,6 +15,7 @@ import {
 } from "./proposal.ts";
 import { DUPLICATE_THRESHOLD } from "./proposal.ts";
 import { StageLogger } from "./stages.ts";
+import type { EventBus, ExecutionCompletedEvent } from "./events.ts";
 
 /**
  * The model-facing agent used for discovery.
@@ -757,11 +758,15 @@ export class DiscoveryEngine {
   private readonly options: DiscoveryOptions;
   /** The 13 pipeline stage transitions (observability only). */
   private stages: StageLogger;
+  private eventBus: EventBus | null = null;
 
-  constructor(adapter: OpenCodeAdapter, options: DiscoveryOptions) {
+  constructor(adapter: OpenCodeAdapter, options: DiscoveryOptions, eventBus?: EventBus) {
     this.adapter = adapter;
     this.options = options;
     this.stages = new StageLogger({ onLifecycle: options.onLifecycle, now: options.now ?? Date.now });
+    if (eventBus) {
+      this.eventBus = eventBus;
+    }
   }
 
   /** Directory holding this engine's resumable-run manifest: an explicit
@@ -909,6 +914,28 @@ export class DiscoveryEngine {
     result.persisted = this.options.dryRun === true || stopped
       ? false
       : await this.persist(result, this.options.cacheDir ?? defaultCacheDir());
+
+    // Publish discovery completion event if persisted
+    if (result.persisted && this.eventBus) {
+      const completedEvent: ExecutionCompletedEvent = {
+        eventType: "execution.completed",
+        id: `evt_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        timestamp: Date.now(),
+        aggregateType: "execution",
+        aggregateId: result.runId || "",
+        payload: {
+          executionId: result.runId || "",
+          taskId: "", // Discovery runs don't have a specific task ID
+          areaId: "run",
+          proposalsAccepted: result.proposals.length,
+          proposalsRejected: result.rejected.length,
+          durationMs: Date.now() - startedAt,
+        },
+        schemaVersion: 1,
+      };
+      this.eventBus.publish(completedEvent);
+    }
+
     this.stages.complete("discovery", { areaId: "run", durationMs: Date.now() - startedAt });
     return result;
   }
@@ -979,7 +1006,7 @@ export class DiscoveryEngine {
         });
         this.lifecycle("ERROR", "evidence", "extraction_failed", {
           areaId: area.key,
-          reason: "no source excerpts extracted",
+          reason: { noSourceExcerptsExtracted: true },
         });
       } else {
         evidenceBlock = renderSourceEvidenceBlock(excerpts);
@@ -1251,7 +1278,12 @@ export class DiscoveryEngine {
       rejected: rejected.length,
       durationMs: Date.now() - areaStartedAt,
     });
-    this.stages.complete("proposal", { areaId: area.key, sessionId });
+    this.stages.complete("proposal", {
+      areaId: area.key,
+      sessionId,
+      accepted: accepted.length,
+      rejected: rejected.length,
+    });
     return {
       area: area.key,
       status: "ok",

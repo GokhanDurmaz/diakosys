@@ -26,7 +26,7 @@ test("schema is versioned and migrations run once", () => {
     return rows.map((r) => (r as { version: number }).version);
   };
   const v1 = (db1.prepare("SELECT MAX(version) v FROM schema_info").get() as { v: number }).v;
-  assert.equal(v1, 3, "every versioned migration records its version on first open");
+  assert.equal(v1, 5, "every versioned migration records its version on first open");
   applyMigrations(db1);
   const reapplied = versions();
   const seenOnce = reapplied.length === new Set(reapplied).size;
@@ -35,11 +35,11 @@ test("schema is versioned and migrations run once", () => {
 
   const db2 = openDatabase(dbPath);
   const v2 = (db2.prepare("SELECT MAX(version) v FROM schema_info").get() as { v: number }).v;
-  assert.equal(v2, 3, "no duplicate migration on reopen");
+  assert.equal(v2, 5, "no duplicate migration on reopen");
   const reopened = (db2.prepare("SELECT version FROM schema_info ORDER BY version").all() as unknown[]).map(
     (r) => (r as { version: number }).version,
   );
-  assert.deepEqual(reopened, [1, 2, 3], "both migration records present exactly once");
+  assert.deepEqual(reopened, [1, 2, 3, 4, 5], "all migration records present exactly once");
   closeDatabase(db2);
 });
 
@@ -223,7 +223,7 @@ test("schema_info missing upgrades from scratch", () => {
 
   const db = openDatabase(dbPath);
   const version = (db.prepare("SELECT MAX(version) v FROM schema_info").get() as { v: number }).v;
-  assert.equal(version, 3, "all migrations applied when schema_info is absent");
+  assert.equal(version, 5, "all migrations applied when schema_info is absent");
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name = 'discovery_runs'").get() !== undefined, true);
   assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name = 'schema_info'").get() !== undefined, true);
   closeDatabase(db);
@@ -244,7 +244,7 @@ test("empty schema_info table upgrades from scratch", () => {
 
   const db = openDatabase(dbPath);
   const version = (db.prepare("SELECT MAX(version) v FROM schema_info").get() as { v: number }).v;
-  assert.equal(version, 3, "empty schema_info is not a version");
+  assert.equal(version, 5, "empty schema_info is not a version");
   closeDatabase(db);
 });
 
@@ -266,7 +266,7 @@ test("duplicate schema_info version rows report the highest version", () => {
 
   const db = openDatabase(dbPath);
   const version = (db.prepare("SELECT MAX(version) v FROM schema_info").get() as { v: number }).v;
-  assert.equal(version, 3, "duplicate rows resolve to the maximum version");
+  assert.equal(version, 5, "duplicate rows resolve to the maximum version");
   closeDatabase(db);
 });
 
@@ -465,6 +465,425 @@ test("proposal persistence rolls back after a mid-batch failure", () => {
 } finally {
   store.createTaskWithCoordinator = original;
   closeDatabase(db);
+}
+});
+
+// ---------------------------------------------------------------------------
+// Migration v5 — migrate-sse-events-to-sequence
+// ---------------------------------------------------------------------------
+
+interface PreV5Event {
+  id: string;
+  timestamp: number;
+  eventType: string;
+  aggregateType: string;
+  aggregateId: string;
+  payload: string;
+  schemaVersion?: number;
+}
+
+/**
+ * Build a database exactly as migration v4 leaves it: every table, index and
+ * seed row from migrations 1-4, schema_info rows for versions 1-4, and an
+ * sse_events table without the v5 sequence column.
+ */
+function createPreV5Database(dbPath: string, events: readonly PreV5Event[] = []): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`
+      CREATE TABLE tasks (
+        id                 TEXT PRIMARY KEY,
+        title              TEXT NOT NULL,
+        description        TEXT NOT NULL DEFAULT '',
+        status             TEXT NOT NULL,
+        priority           INTEGER NOT NULL DEFAULT 0,
+        created_at         INTEGER NOT NULL,
+        updated_at         INTEGER NOT NULL,
+        attempts           INTEGER NOT NULL DEFAULT 0,
+        last_run_at        INTEGER,
+        execution_metadata JSON NOT NULL DEFAULT '{}'
+      );
+      CREATE TABLE task_events (
+        seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id     TEXT NOT NULL REFERENCES tasks(id),
+        event_type  TEXT NOT NULL,
+        from_state  TEXT,
+        to_state    TEXT,
+        detail      TEXT,
+        created_at  INTEGER NOT NULL
+      );
+      CREATE INDEX idx_tasks_status ON tasks(status);
+      CREATE INDEX idx_events_task  ON task_events(task_id, seq);
+
+      CREATE TABLE discovery_runs (
+        id              TEXT PRIMARY KEY,
+        started_at      INTEGER NOT NULL,
+        finished_at     INTEGER,
+        status          TEXT NOT NULL CHECK (status IN ('running','completed','failed','interrupted')),
+        areas_total     INTEGER NOT NULL,
+        areas_completed INTEGER NOT NULL,
+        raw_proposals   INTEGER NOT NULL DEFAULT 0,
+        accepted        INTEGER NOT NULL DEFAULT 0,
+        rejected        INTEGER NOT NULL DEFAULT 0,
+        error           TEXT,
+        model           TEXT
+      );
+      CREATE INDEX idx_runs_status ON discovery_runs(status);
+      CREATE INDEX idx_runs_status_finished ON discovery_runs(status, finished_at);
+
+      ALTER TABLE tasks ADD COLUMN exec_gen INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE tasks ADD COLUMN lease_owner TEXT;
+      ALTER TABLE tasks ADD COLUMN lease_expires_at INTEGER;
+
+      CREATE TABLE instance_locks (
+        id         INTEGER PRIMARY KEY CHECK (id = 1),
+        owner      TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
+      INSERT INTO instance_locks (id, owner, generation, expires_at) VALUES (1, '', 0, 0);
+
+      CREATE TABLE sse_events (
+        id              TEXT PRIMARY KEY,
+        timestamp       INTEGER NOT NULL,
+        event_type      TEXT NOT NULL,
+        aggregate_type  TEXT NOT NULL,
+        aggregate_id    TEXT NOT NULL,
+        payload         TEXT NOT NULL,
+        schema_version  INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE INDEX idx_sse_events_timestamp ON sse_events(timestamp);
+      CREATE INDEX idx_sse_events_aggregate ON sse_events(aggregate_type, aggregate_id);
+
+      CREATE TABLE schema_info (
+        version INTEGER NOT NULL,
+        name    TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+      INSERT INTO schema_info (version, name, applied_at) VALUES
+        (1, 'create-tasks-and-events', 1700000000000),
+        (2, 'create-discovery-runs', 1700000000001),
+        (3, 'add-leases-and-instance-lock', 1700000000002),
+        (4, 'create-sse-event-storage', 1700000000003);
+    `);
+
+    const insert = db.prepare(`
+      INSERT INTO sse_events
+        (id, timestamp, event_type, aggregate_type, aggregate_id, payload, schema_version)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const event of events) {
+      insert.run(
+        event.id,
+        event.timestamp,
+        event.eventType,
+        event.aggregateType,
+        event.aggregateId,
+        event.payload,
+        event.schemaVersion ?? 1,
+      );
+    }
+
+    const version = (db.prepare("SELECT MAX(version) v FROM schema_info").get() as { v: number }).v;
+    assert.equal(version, 4, "pre-v5 fixture stops at migration v4");
+    const columns = db.prepare("PRAGMA table_info(sse_events)").all() as unknown as { name: string }[];
+    assert.equal(
+      columns.some((column) => column.name === "sequence"),
+      false,
+      "pre-v5 fixture has no sequence column",
+    );
+  } finally {
+    db.close();
+  }
+}
+
+test("migration v5 creates sse_events with sequence as primary key", () => {
+  const dir = tempDir();
+  const dbPath = path.join(dir, "tasks_v5.db");
+  createPreV5Database(dbPath);
+
+  const db = openDatabase(dbPath);
+  try {
+    const applied = db
+      .prepare("SELECT version, name FROM schema_info ORDER BY version")
+      .all() as unknown as { version: number; name: string }[];
+    assert.deepEqual(
+      applied.map((row) => row.version),
+      [1, 2, 3, 4, 5],
+      "migration v5 is recorded on top of the existing v1-v4 rows",
+    );
+    assert.equal(applied[4]?.name, "migrate-sse-events-to-sequence", "v5 migration name is recorded");
+
+    const columns = db.prepare("PRAGMA table_info(sse_events)").all() as unknown as {
+      name: string;
+      type: string;
+      pk: number;
+    }[];
+    const sequence = columns.find((column) => column.name === "sequence");
+    assert.equal(sequence?.type, "INTEGER", "sequence should be INTEGER type");
+    assert.equal(sequence?.pk, 1, "sequence should be the primary key");
+    const id = columns.find((column) => column.name === "id");
+    assert.equal(id?.type, "TEXT", "id should remain a TEXT column");
+    assert.equal(id?.pk, 0, "id should no longer be the primary key");
+
+    const table = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sse_events'")
+      .get() as { sql: string };
+    assert.match(
+      table.sql,
+      /sequence\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT/i,
+      "sequence should be INTEGER PRIMARY KEY AUTOINCREMENT",
+    );
+  } finally {
+    closeDatabase(db);
+  }
+});
+
+test("migration v5 preserves all sse_events data", () => {
+  const dir = tempDir();
+  const dbPath = path.join(dir, "tasks_v5_data.db");
+  const events: readonly PreV5Event[] = [
+    {
+      id: "evt_001",
+      timestamp: 1700000000000,
+      eventType: "task.created",
+      aggregateType: "task",
+      aggregateId: "task-1",
+      payload: '{"key": "value1"}',
+      schemaVersion: 1,
+    },
+    {
+      id: "evt_002",
+      timestamp: 1700000001000,
+      eventType: "task.transitioned",
+      aggregateType: "task",
+      aggregateId: "task-1",
+      payload: '{"from": "DISCOVERED", "to": "READY"}',
+      schemaVersion: 2,
+    },
+    {
+      id: "evt_003",
+      timestamp: 1700000002000,
+      eventType: "discovery.completed",
+      aggregateType: "discovery",
+      aggregateId: "disc-1",
+      payload: '{"count": 42}',
+      schemaVersion: 3,
+    },
+  ];
+  createPreV5Database(dbPath, events);
+
+  const db = openDatabase(dbPath);
+  try {
+    const rows = db
+      .prepare(
+        `SELECT sequence, id, timestamp, event_type, aggregate_type, aggregate_id, payload, schema_version
+         FROM sse_events ORDER BY sequence ASC`,
+      )
+      .all() as unknown as {
+      sequence: number;
+      id: string;
+      timestamp: number;
+      event_type: string;
+      aggregate_type: string;
+      aggregate_id: string;
+      payload: string;
+      schema_version: number;
+    }[];
+    assert.deepEqual(
+      rows.map((row) => ({ ...row })),
+      [
+        {
+          sequence: 1,
+          id: "evt_001",
+          timestamp: 1700000000000,
+          event_type: "task.created",
+          aggregate_type: "task",
+          aggregate_id: "task-1",
+          payload: '{"key": "value1"}',
+          schema_version: 1,
+        },
+        {
+          sequence: 2,
+          id: "evt_002",
+          timestamp: 1700000001000,
+          event_type: "task.transitioned",
+          aggregate_type: "task",
+          aggregate_id: "task-1",
+          payload: '{"from": "DISCOVERED", "to": "READY"}',
+          schema_version: 2,
+        },
+        {
+          sequence: 3,
+          id: "evt_003",
+          timestamp: 1700000002000,
+          event_type: "discovery.completed",
+          aggregate_type: "discovery",
+          aggregate_id: "disc-1",
+          payload: '{"count": 42}',
+          schema_version: 3,
+        },
+      ],
+      "every event is preserved with its id and data unchanged",
+    );
+  } finally {
+    closeDatabase(db);
+  }
+});
+
+test("migration v5 creates proper indexes on sse_events", () => {
+  const dir = tempDir();
+  const dbPath = path.join(dir, "tasks_v5_indexes.db");
+  createPreV5Database(dbPath);
+
+  const db = openDatabase(dbPath);
+  try {
+    const indexes = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'sse_events' AND name LIKE 'idx_%'",
+      )
+      .all() as unknown as { name: string }[];
+    assert.deepEqual(
+      indexes.map((index) => index.name).sort(),
+      ["idx_sse_events_aggregate", "idx_sse_events_id", "idx_sse_events_timestamp"],
+      "all expected sse_events indexes are recreated",
+    );
+
+    const indexColumns = (name: string) =>
+      (db.prepare(`PRAGMA index_info(${name})`).all() as unknown as { name: string }[]).map(
+        (column) => column.name,
+      );
+    assert.deepEqual(indexColumns("idx_sse_events_timestamp"), ["timestamp"]);
+    assert.deepEqual(indexColumns("idx_sse_events_aggregate"), ["aggregate_type", "aggregate_id"]);
+    assert.deepEqual(indexColumns("idx_sse_events_id"), ["id"]);
+  } finally {
+    closeDatabase(db);
+  }
+});
+
+test("migration v5 uses sequence for ordering", () => {
+  const dir = tempDir();
+  const dbPath = path.join(dir, "tasks_v5_order.db");
+
+  // Insertion order deliberately disagrees with timestamp order.
+  const events: readonly PreV5Event[] = [
+    {
+      id: "evt_late",
+      timestamp: 1700000003000,
+      eventType: "event.late",
+      aggregateType: "agg",
+      aggregateId: "a1",
+      payload: "{}",
+    },
+    {
+      id: "evt_early",
+      timestamp: 1700000001000,
+      eventType: "event.early",
+      aggregateType: "agg",
+      aggregateId: "a1",
+      payload: "{}",
+    },
+    {
+      id: "evt_middle",
+      timestamp: 1700000002000,
+      eventType: "event.middle",
+      aggregateType: "agg",
+      aggregateId: "a1",
+      payload: "{}",
+    },
+  ];
+  createPreV5Database(dbPath, events);
+
+  const db = openDatabase(dbPath);
+  try {
+    const bySequence = db
+      .prepare("SELECT sequence, id FROM sse_events ORDER BY sequence ASC")
+      .all() as unknown as { sequence: number; id: string }[];
+    assert.deepEqual(
+      bySequence.map((row) => row.sequence),
+      [1, 2, 3],
+      "sequence values follow rowid/insertion order",
+    );
+    assert.deepEqual(
+      bySequence.map((row) => row.id),
+      ["evt_late", "evt_early", "evt_middle"],
+      "sequence order is insertion order",
+    );
+
+    const byTimestamp = db
+      .prepare("SELECT id FROM sse_events ORDER BY timestamp ASC, id ASC")
+      .all() as unknown as { id: string }[];
+    assert.deepEqual(
+      byTimestamp.map((row) => row.id),
+      ["evt_early", "evt_middle", "evt_late"],
+      "timestamp order intentionally differs from insertion order",
+    );
+    assert.notDeepEqual(
+      bySequence.map((row) => row.id),
+      byTimestamp.map((row) => row.id),
+      "the test would not prove sequence ordering if the two orders matched",
+    );
+  } finally {
+    closeDatabase(db);
+  }
+});
+
+test("reopening a migrated database does not execute migration v5 again", () => {
+  const dir = tempDir();
+  const dbPath = path.join(dir, "tasks_v5_reopen.db");
+  createPreV5Database(dbPath, [
+    {
+      id: "evt_reopen",
+      timestamp: 1700000000000,
+      eventType: "task.created",
+      aggregateType: "task",
+      aggregateId: "task-1",
+      payload: "{}",
+    },
+  ]);
+
+  const first = openDatabase(dbPath);
+  const firstAppliedAt = (
+    first.prepare("SELECT applied_at FROM schema_info WHERE version = 5").get() as {
+      applied_at: number;
+    }
+  ).applied_at;
+  assert.equal(
+    (first.prepare("SELECT sequence FROM sse_events WHERE id = 'evt_reopen'").get() as {
+      sequence: number;
+    }).sequence,
+    1,
+    "migration v5 ran on the first open",
+  );
+  closeDatabase(first);
+
+  const reopened = openDatabase(dbPath);
+  try {
+    const v5Rows = reopened
+      .prepare("SELECT version, applied_at FROM schema_info WHERE version = 5")
+      .all() as unknown as { version: number; applied_at: number }[];
+    assert.equal(v5Rows.length, 1, "migration v5 is recorded exactly once");
+    assert.equal(v5Rows[0]?.applied_at, firstAppliedAt, "the v5 record was not rewritten on reopen");
+
+    const duplicates = reopened
+      .prepare(
+        "SELECT version FROM schema_info GROUP BY version HAVING COUNT(*) > 1",
+      )
+      .all() as unknown as { version: number }[];
+    assert.deepEqual(duplicates, [], "no migration version is recorded twice");
+
+    assert.equal(
+      (reopened.prepare("SELECT MAX(version) v FROM schema_info").get() as { v: number }).v,
+      5,
+      "the reopened database is still at version 5",
+    );
+    assert.equal(
+      (reopened.prepare("SELECT COUNT(*) AS c FROM sse_events").get() as { c: number }).c,
+      1,
+      "reopening does not rebuild or duplicate the migrated events",
+    );
+  } finally {
+    closeDatabase(reopened);
   }
 });
 

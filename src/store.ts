@@ -4,6 +4,7 @@ import { canTransition } from "./state.ts";
 import { withWriteTx, type WriteTx } from "./tx.ts";
 import { coordinatorGuardTxn, type CoordinatorAuthority } from "./locks.ts";
 import { now as nowMs } from "./clock.ts";
+import { eventBus, type TaskCreatedEvent, type TaskTransitionedEvent, type SupportedEventType } from "./events.ts";
 
 export type { CoordinatorAuthority } from "./locks.ts";
 
@@ -108,6 +109,24 @@ export class TaskStore {
         JSON.stringify({}),
       );
     this.appendEventTx(tx, task.id, "created", null, task.status, null);
+
+    // Publish SSE event
+    const createdEvent = {
+      eventType: "task.created",
+      id: `evt_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: Date.now(),
+      aggregateType: "task",
+      aggregateId: task.id,
+      payload: {
+        title: task.title,
+        description: task.description,
+        priority: task.priority,
+        initialStatus: task.status,
+      },
+      schemaVersion: 1,
+    };
+    eventBus.publish(createdEvent as SupportedEventType);
+
     return task;
   }
 
@@ -145,7 +164,30 @@ export class TaskStore {
       if (!canTransition(task.status, to)) {
         throw new Error(`invalid transition: ${task.status} → ${to}`);
       }
-      return applyTransition(this.db, tx, task, to, detail ?? null);
+
+      // Get fromState before transition
+      const fromState = task.status;
+
+      const result = applyTransition(this.db, tx, task, to, detail ?? null);
+
+      // Publish SSE event for state transition
+      const transitionEvent = {
+        eventType: "task.transitioned",
+        id: `evt_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        timestamp: Date.now(),
+        aggregateType: "task",
+        aggregateId: id,
+        payload: {
+          taskId: id,
+          fromState,
+          toState: to,
+          detail,
+        },
+        schemaVersion: 1,
+      };
+      eventBus.publish(transitionEvent as SupportedEventType);
+
+      return result;
     });
   }
 
